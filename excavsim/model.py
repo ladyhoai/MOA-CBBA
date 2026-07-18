@@ -94,12 +94,18 @@ class ExcavationModel(Model):
             self.grid.soil_volume.data[cell] += vol
             task = self.tasks.add(cell, vol)
             TaskMarker(self, self.grid[cell], task)
-
+        # print(len(self.tasks.all), "tasks placed")
         # --- robots ----------------------------------------------------- #
         self.robots: list[ExcavatorRobot] = []
         for _ in range(n_robots):
             cell = self.grid[self._random_empty_coord()]
             self.robots.append(ExcavatorRobot(self, cell, DEFAULT_SPEC))
+
+        # Populating the list of task for each robot to prepare for CBBA
+        for robot in self.robots:
+            
+            robot.updateTaskList(self.tasks.all)
+            robot.CBBA.createBundle(self, robot, {}, {}, [])
 
         self.allocator = ALLOCATORS[allocator]()
 
@@ -130,7 +136,7 @@ class ExcavationModel(Model):
     # -------------------------------------------------------------------- #
     def step(self) -> None:
         self.tick += 1
-        self.allocator.allocate(self)              # bidding + consensus
+        self.allocator.allocate(self)              # bidding + consensus (Greedy allocation)
         self.agents.shuffle_do("step")             # execute (random order)
         self.changed_cells.clear()
         self.datacollector.collect(self)

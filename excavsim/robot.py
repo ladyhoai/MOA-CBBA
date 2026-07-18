@@ -20,6 +20,7 @@ from __future__ import annotations
 from enum import Enum, auto
 
 from mesa.discrete_space import CellAgent
+from .allocation import ALLOCATORS
 
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
@@ -63,6 +64,21 @@ class ExcavatorRobot(CellAgent):
         self._unload_left = 0
         self._stuck = 0
 
+        self.robot_id = len(model.robots)
+
+    # The parameters below are used for CBBA (non-greedy algorithms)
+        # Each robot instance will run its own copy of the algorithm because it is decentralised
+        self.CBBA = ALLOCATORS["cbba"]()
+        self.winningBidList = []         # y_i
+        self.winningAgentList = []       # z_i
+        self.bundle = []                 # b_i
+        self.path = []                   # p_i
+
+        # Each robot can hold 4 task at one (but they still have to visit the dump site to complete one task).
+        # In the future, if we can combine the excavator and dump truck into a single machine, this variable will
+        # indicate the maximum payload of the machine. (Still to be decided)
+        self.capacity = 6
+
     # ------------------------------------------------------------------ #
     # assignment interface used by allocators (writes the BAM row x_i)
     # ------------------------------------------------------------------ #
@@ -103,6 +119,11 @@ class ExcavatorRobot(CellAgent):
                 self._unload_left = self.model.t_unload
         elif self.stage is Stage.UNLOAD:
             self._unload_tick()
+
+    def updateTaskList(self, taskList) -> None:
+        """Update the task list for the class instances of all allocators. Call this function in model.py 
+        when new tasks is created at the beginning of the simulation. taskList is a list in TaskRegistry"""
+        self.CBBA.task_list = taskList
 
     # ------------------------------------------------------------------ #
     # movement with collision avoidance
