@@ -18,6 +18,7 @@ from mesa.discrete_space import (FixedAgent, OrthogonalMooreGrid,
                                  PropertyLayer)
 
 from .allocation import ALLOCATORS
+from .comms import CommNetwork
 from .costs import RobotSpec, objective
 from .pathfinding import nearest_work_cell
 from .robot import ExcavatorRobot
@@ -55,8 +56,13 @@ class ExcavationModel(Model):
         allocator: str = "greedy",
         w1: float = 1.0,
         w2: float = 1.0,
-        rock_fraction: float = 0.15,
-        gravel_fraction: float = 0.2,
+        comm_range: float | None = None,
+        packet_loss: float = 0.0,
+        comm_latency: int = 0,
+        comm_bandwidth: int | None = None,
+
+        rock_fraction: float = 0, # 0.15,
+        gravel_fraction: float = 0, # 0.2,
         task_volume: tuple[float, float] = (1.0, 4.0),
         seed: int | None = None,
     ):
@@ -103,11 +109,36 @@ class ExcavationModel(Model):
 
         # Populating the list of task for each robot to prepare for CBBA
         for robot in self.robots:
-            
             robot.updateTaskList(self.tasks.all)
-            robot.CBBA.createBundle(self, robot, {}, {}, [])
+        
+        self.comms = CommNetwork(self, comm_range=comm_range,
+                                 packet_loss=packet_loss,
+                                 latency=comm_latency,
+                                 bandwidth=comm_bandwidth)
+        ######## TESTING OF CBBA ALLOCATION ########
+        MAX_ROUNDS = 20
+        for rnd in range(1, MAX_ROUNDS + 1):
+            # Phase 1: everyone (re)builds its bundle on its own state
+            for r in self.robots:
+                r.CBBA.createBundle(self, r, r.CBBA.winningAgentList,
+                                    r.CBBA.winningBidList, r.CBBA.bundle)
+                r.CBBA.broadcast(r, rnd)
+            self.comms.flush_and_deliver(self.tick)
+
+            # Phase 2: consensus; stop when nobody changed anything
+            changed = [r.CBBA.resolveConflicts(self, r, r.receive_all())
+                    for r in self.robots]
+            if not any(changed):
+                print(f"CBBA converged in {rnd} rounds")
+                break
+                
 
         self.allocator = ALLOCATORS[allocator]()
+
+        # --- Phase 6 communication layer (neutral by default) ----------- #
+        # Change comm_range to a number so that the s vector is utilised
+        
+
 
         # --- metrics (Table 1, item 1.3) -------------------------------- #
         self.datacollector = DataCollector(
@@ -136,6 +167,8 @@ class ExcavationModel(Model):
     # -------------------------------------------------------------------- #
     def step(self) -> None:
         self.tick += 1
+        self.comms.flush_and_deliver(self.tick)    # in-flight messages land
+
         self.allocator.allocate(self)              # bidding + consensus (Greedy allocation)
         self.agents.shuffle_do("step")             # execute (random order)
         self.changed_cells.clear()

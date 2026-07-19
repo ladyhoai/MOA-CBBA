@@ -156,7 +156,7 @@ fit_canvas(renderer.canvas)      # apply to the initial frame too
 model_params = {
     "seed": {"type": "InputText", "value": 42, "label": "random seed"},
     "n_robots": Slider("robots", 4, 1, 12, 1),
-    "n_tasks": Slider("tasks", 10, 1, 30, 1),
+    "n_tasks": Slider("tasks", 8, 1, 30, 1),
     "rock_fraction": Slider("rock fraction", 0.15, 0.0, 0.5, 0.05),
     "gravel_fraction": Slider("gravel fraction", 0.20, 0.0, 0.5, 0.05),
     "allocator": {

@@ -69,15 +69,21 @@ class ExcavatorRobot(CellAgent):
     # The parameters below are used for CBBA (non-greedy algorithms)
         # Each robot instance will run its own copy of the algorithm because it is decentralised
         self.CBBA = ALLOCATORS["cbba"]()
-        self.winningBidList = []         # y_i
-        self.winningAgentList = []       # z_i
-        self.bundle = []                 # b_i
-        self.path = []                   # p_i
 
         # Each robot can hold 4 task at one (but they still have to visit the dump site to complete one task).
         # In the future, if we can combine the excavator and dump truck into a single machine, this variable will
         # indicate the maximum payload of the machine. (Still to be decided)
         self.capacity = 6
+
+        # communication (Phase 6): thin wrappers over the model's network
+    # ------------------------------------------------------------------ #
+    def send(self, payload: dict, to=None) -> None:
+        """Queue a message; to=None broadcasts to robots in range."""
+        self.model.comms.send(self, payload, to)
+
+    def receive_all(self):
+        """Drain this robot's inbox (list of Message, FIFO)."""
+        return self.model.comms.receive_all(self)
 
     # ------------------------------------------------------------------ #
     # assignment interface used by allocators (writes the BAM row x_i)
