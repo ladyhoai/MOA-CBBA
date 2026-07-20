@@ -20,7 +20,7 @@ from __future__ import annotations
 from enum import Enum, auto
 
 from mesa.discrete_space import CellAgent
-from .allocation import ALLOCATORS
+from .allocation import CBBAAgent
 
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
@@ -68,7 +68,7 @@ class ExcavatorRobot(CellAgent):
 
     # The parameters below are used for CBBA (non-greedy algorithms)
         # Each robot instance will run its own copy of the algorithm because it is decentralised
-        self.CBBA = ALLOCATORS["cbba"]()
+        self.CBBA = CBBAAgent()
 
         # Each robot can hold 4 task at one (but they still have to visit the dump site to complete one task).
         # In the future, if we can combine the excavator and dump truck into a single machine, this variable will

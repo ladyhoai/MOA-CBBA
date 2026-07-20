@@ -111,34 +111,31 @@ class ExcavationModel(Model):
         for robot in self.robots:
             robot.updateTaskList(self.tasks.all)
         
+        # --- Phase 6 communication layer (neutral by default) ----------- #
+        # Change comm_range to a number so that the s vector is utilised
+
         self.comms = CommNetwork(self, comm_range=comm_range,
                                  packet_loss=packet_loss,
                                  latency=comm_latency,
                                  bandwidth=comm_bandwidth)
         ######## TESTING OF CBBA ALLOCATION ########
-        MAX_ROUNDS = 20
-        for rnd in range(1, MAX_ROUNDS + 1):
-            # Phase 1: everyone (re)builds its bundle on its own state
-            for r in self.robots:
-                r.CBBA.createBundle(self, r, r.CBBA.winningAgentList,
-                                    r.CBBA.winningBidList, r.CBBA.bundle)
-                r.CBBA.broadcast(r, rnd)
-            self.comms.flush_and_deliver(self.tick)
+        # MAX_ROUNDS = 20
+        # for rnd in range(1, MAX_ROUNDS + 1):
+        #     # Phase 1: everyone (re)builds its bundle on its own state
+        #     for r in self.robots:
+        #         r.CBBA.createBundle(self, r, r.CBBA.winningAgentList,
+        #                             r.CBBA.winningBidList, r.CBBA.bundle)
+        #         r.CBBA.broadcast(r, rnd)
+        #     self.comms.flush_and_deliver(self.tick)
 
-            # Phase 2: consensus; stop when nobody changed anything
-            changed = [r.CBBA.resolveConflicts(self, r, r.receive_all())
-                    for r in self.robots]
-            if not any(changed):
-                print(f"CBBA converged in {rnd} rounds")
-                break
+        #     # Phase 2: consensus; stop when nobody changed anything
+        #     changed = [r.CBBA.resolveConflicts(r, r.receive_all())
+        #             for r in self.robots]
+        #     if not any(changed):
+        #         print(f"CBBA converged in {rnd} rounds")
+        #         break
                 
-
-        self.allocator = ALLOCATORS[allocator]()
-
-        # --- Phase 6 communication layer (neutral by default) ----------- #
-        # Change comm_range to a number so that the s vector is utilised
-        
-
+        self.allocator = ALLOCATORS[allocator]()        
 
         # --- metrics (Table 1, item 1.3) -------------------------------- #
         self.datacollector = DataCollector(

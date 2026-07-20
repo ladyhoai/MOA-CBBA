@@ -50,7 +50,7 @@ def astar(
         return [start]
     # heap key: (f, x, y, tie) -> fully deterministic pop order
     open_heap: list[tuple[float, int, int, int, Coord]] = [
-        (_h(start, goals), start[0], start[1], 0, start)]
+        (_h(start, goals), start[0], start[1], 0, start)] # pyright: ignore[reportArgumentType]
     g: dict[Coord, float] = {start: 0.0}
     came: dict[Coord, Coord] = {}
     tie = 0
@@ -74,7 +74,7 @@ def astar(
                 came[nxt] = cur
                 tie += 1
                 heapq.heappush(open_heap,
-                               (ng + _h(nxt, goals), nxt[0], nxt[1], tie, nxt))
+                               (ng + _h(nxt, goals), nxt[0], nxt[1], tie, nxt)) # pyright: ignore[reportArgumentType]
     return None
 
 
