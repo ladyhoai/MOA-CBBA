@@ -24,7 +24,7 @@ from .allocation import CBBAAgent
 
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
-from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain
+from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMMA, GAMMA
 
 STUCK_LIMIT = 3
 
@@ -167,11 +167,12 @@ class ExcavatorRobot(CellAgent):
                 if self._stuck >= STUCK_LIMIT:
                     self._reroute(occupied)
                 return False
+            currentPosition = self.cell.coordinate
             self._path.pop(0)
             self.move_to(self.model.grid[nxt])
             self._move_credit -= 1.0
             self._stuck = 0
-            self._spend(ALPHA)  # travel energy per grid step (Eq. 5)
+            self._spend_move(currentPosition, nxt)  # travel energy per grid step (Eq. 5)
         return not self._path
 
     # ------------------------------------------------------------------ #
@@ -252,6 +253,20 @@ class ExcavatorRobot(CellAgent):
         self.dump_cell = None
         self.stage = Stage.IDLE  # Algorithm 1, line 11: x_ij <- 0
 
-    def _spend(self, amount: float) -> None:
+    def _spend_move(self, frm, to) -> None:
+        """ Only elevation GAINED costs energy
+        (descent is free), and climbing loaded costs
+        LOADED_CLIMB_FACTOR times more.
+        """
+        self._spend(ALPHA, "travel")
+        elev = self.model.grid.elevation.data
+        # Only charge move energy cost if it is going uphill
+        gain = float(elev[to]) - float(elev[frm])
+        if gain > 0.0:
+            loaded = self.payload > 1e-9
+            factor = FULL_PAYLOAD_GAMMA if loaded else 1.0
+            self._spend(GAMMA * gain * factor, "climb")
+
+    def _spend(self, amount: float, kind: str = "travel") -> None:
         self.energy_used += amount
         self.battery = max(0.0, self.battery - amount)

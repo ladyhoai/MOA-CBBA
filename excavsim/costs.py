@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .terrain import ALPHA, BETA, T_UNLOAD
+from .terrain import ALPHA, BETA, T_UNLOAD, GAMMA, FULL_PAYLOAD_GAMMA
 
 
 @dataclass(frozen=True)
@@ -33,11 +33,15 @@ def n_trips(volume: float, capacity: float) -> int:
     """Eq. (3): n_ij = ceil(V_j / C_i)."""
     return math.ceil(volume / capacity)
 
+# I think the n_trips here should not be taken into consideration. Because if we do that, it is like assigning 1 robot to that entire task which consists of 
+# multiple trips to excavate that cell to target depth. We assigned it to 1 for now!!!!!!!!. 
+# 24/07/26: greedy finished in 135 ticks, energy = 24.35, J(x) = 159.3. CBBA also finished in 135 ticks with the exact same energy usage and ticks. The path travelled I think
+# is also 100% similar.
 
 def tau_ij(spec: RobotSpec, volume: float, hardness: float,
            d_task: float, d_dump: float) -> float:
     """Eq. (4): travel + dig + dump trips + unloading, in ticks."""
-    n = n_trips(volume, spec.capacity)
+    n = 1 # n_trips(volume, spec.capacity)
     t_task = d_task / spec.v_max
     t_dig = volume * hardness / spec.dig_rate
     t_dump = (2 * n - 1) * d_dump / spec.v_max
@@ -46,12 +50,13 @@ def tau_ij(spec: RobotSpec, volume: float, hardness: float,
 
 
 def energy_ij(spec: RobotSpec, volume: float, hardness: float,
-              d_task: float, d_dump: float) -> float:
+              d_task: float, d_dump: float,
+              elevationToTask: float = 0.0, elevationTaskToDump: float = 0.0) -> float:
     """Eq. (5): E_unload = 0 by assumption."""
-    n = n_trips(volume, spec.capacity)
-    e_task = ALPHA * d_task
+    n = 1 # n_trips(volume, spec.capacity)
+    e_task = ALPHA * d_task + GAMMA * elevationToTask # The Gamma part is to account for elevation
     e_dig = BETA * volume * hardness / spec.dig_rate
-    e_dump = ALPHA * (2 * n - 1) * d_dump
+    e_dump = ALPHA * (2 * n - 1) * d_dump + GAMMA * elevationTaskToDump * FULL_PAYLOAD_GAMMA
     return e_task + e_dig + e_dump
 
 

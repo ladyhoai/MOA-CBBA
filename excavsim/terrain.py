@@ -31,3 +31,6 @@ ALPHA = 0.05  # energy per grid step travelled
 BETA = 0.20   # energy per dig tick (see note in costs.py)
 
 T_UNLOAD = 3  # fixed unloading time per dump trip, in ticks (Eq. 4)
+
+GAMMA = 0.10 # energy per meter climbed
+FULL_PAYLOAD_GAMMA = 1.6 # multiplier when the robot is carrying a full payload

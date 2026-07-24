@@ -77,6 +77,18 @@ def astar(
                                (ng + _h(nxt, goals), nxt[0], nxt[1], tie, nxt)) # pyright: ignore[reportArgumentType]
     return None
 
+def path_climb(path, elevation) -> float:
+    """Total elevation travelled along the path which is passed as a parameter"""
+    if not path or len(path) < 2:
+        return 0.0
+    total = 0.0
+    # TODO: I think diagonal travel will have a different way to calculate the elevation gain. TODO
+
+    for a, b in zip(path, path[1:]):
+        d = float(elevation[b]) - float(elevation[a])
+        total += d
+    
+    return total
 
 def astar_distance(
     start: Coord,
@@ -109,7 +121,7 @@ def work_candidates(
                     cands.add(c)
     return cands
 
-
+# DEPRECATED because nearest_work_path exists
 def nearest_work_cell(
     start: Coord,
     targets: Iterable[Coord],
@@ -130,3 +142,23 @@ def nearest_work_cell(
     if path is None:
         return None
     return path[-1], float(len(path) - 1)
+
+def nearest_work_path(
+    start: Coord,
+    targets: Iterable[Coord],
+    width: int,
+    height: int,
+    blocked: set[Coord],
+    occupied: set[Coord] | None = None,
+):
+    """Like nearest_work_cell, but also returns the route taken, so
+    callers can measure elevation gain along it.
+    Returns (cell, distance, path) or None."""
+    occupied = occupied or set()
+    cands = work_candidates(targets, width, height, blocked) - occupied
+    if not cands:
+        return None
+    path = astar(start, cands, width, height, blocked | occupied)
+    if path is None:
+        return None
+    return path[-1], float(len(path) - 1), path

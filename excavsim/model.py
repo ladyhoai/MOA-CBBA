@@ -16,11 +16,11 @@ from __future__ import annotations
 from mesa import DataCollector, Model
 from mesa.discrete_space import (FixedAgent, OrthogonalMooreGrid,
                                  PropertyLayer)
-
+from perlin_numpy import generate_fractal_noise_2d
 from .allocation import ALLOCATORS
 from .comms import CommNetwork
 from .costs import RobotSpec, objective
-from .pathfinding import nearest_work_cell
+from .pathfinding import nearest_work_cell, nearest_work_path
 from .robot import ExcavatorRobot
 from .tasks import TaskRegistry
 from .terrain import T_UNLOAD, Terrain
@@ -61,8 +61,13 @@ class ExcavationModel(Model):
         comm_latency: int = 0,
         comm_bandwidth: int | None = None,
 
-        rock_fraction: float = 0, # 0.15,
-        gravel_fraction: float = 0, # 0.2,
+        rock_fraction: float = 0.15,
+        gravel_fraction: float = 0.2,
+
+        elevation_scale: float = 15.0,
+        elevation_octaves: int = 4,  # How detailed
+        elevation_persistence: float = 0.5,
+
         task_volume: tuple[float, float] = (1.0, 4.0),
         seed: int | None = None,
     ):
@@ -85,6 +90,7 @@ class ExcavationModel(Model):
             PropertyLayer("elevation", (width, height),
                           default_value=0.0, dtype=float))
         self._scatter_terrain(rock_fraction, gravel_fraction)
+        self._scatter_elevation(elevation_octaves, elevation_persistence, elevation_scale)
 
         # --- dump sites: 2x2 impassable blocks --------------------------- #
         self.dump_blocks: list[tuple[Coord, ...]] = []
@@ -118,22 +124,6 @@ class ExcavationModel(Model):
                                  packet_loss=packet_loss,
                                  latency=comm_latency,
                                  bandwidth=comm_bandwidth)
-        ######## TESTING OF CBBA ALLOCATION ########
-        # MAX_ROUNDS = 20
-        # for rnd in range(1, MAX_ROUNDS + 1):
-        #     # Phase 1: everyone (re)builds its bundle on its own state
-        #     for r in self.robots:
-        #         r.CBBA.createBundle(self, r, r.CBBA.winningAgentList,
-        #                             r.CBBA.winningBidList, r.CBBA.bundle)
-        #         r.CBBA.broadcast(r, rnd)
-        #     self.comms.flush_and_deliver(self.tick)
-
-        #     # Phase 2: consensus; stop when nobody changed anything
-        #     changed = [r.CBBA.resolveConflicts(r, r.receive_all())
-        #             for r in self.robots]
-        #     if not any(changed):
-        #         print(f"CBBA converged in {rnd} rounds")
-        #         break
                 
         self.allocator = ALLOCATORS[allocator]()        
 
@@ -193,6 +183,7 @@ class ExcavationModel(Model):
                          sum(r.energy_used for r in self.robots),
                          self.w1, self.w2)
 
+    #### COULD BE DEPRECATED BECAUSE DUMP_WORK_PATH EXISTS
     def dump_work_cell(self, coord: Coord,
                        occupied: set[Coord] | None = None):
         """Nearest unload position: a traversable cell adjacent to any
@@ -202,6 +193,19 @@ class ExcavationModel(Model):
         best = None
         for block in self.dump_blocks:
             found = nearest_work_cell(coord, block, self.grid.width,
+                                      self.grid.height,
+                                      self.blocked_cells(), occupied)
+            if found and (best is None or found[1] < best[1]):
+                best = found
+        return best
+    
+    def dump_work_path(self, coord: Coord,
+                       occupied: set[Coord] | None = None):
+        """Like dump_work_cell, but also returns the route, so callers
+        can measure elevation gain. Returns (cell, dist, path) or None."""
+        best = None
+        for block in self.dump_blocks:
+            found = nearest_work_path(coord, block, self.grid.width,
                                       self.grid.height,
                                       self.blocked_cells(), occupied)
             if found and (best is None or found[1] < best[1]):
@@ -242,6 +246,28 @@ class ExcavationModel(Model):
                     self.grid.terrain.data[x, y] = int(Terrain.ROCK)
                 elif u < rock_frac + gravel_frac:
                     self.grid.terrain.data[x, y] = int(Terrain.GRAVEL)
+
+    def _scatter_elevation(self, octaves: int, persistence: float, height_scale: float) -> None:
+        if height_scale <= 0.0:
+            return
+        w, h = self.grid.width, self.grid.height
+        res, lacunarity = 2, 2 # fractal parameters
+        block = res * lacunarity ** (octaves - 1) # Required noise size
+        
+        # Round up to the nearest multiple of "block"
+        pw = -(-w // block) * block
+        ph = -(-h // block) * block
+
+        field = generate_fractal_noise_2d((pw, ph), (res, res), octaves=octaves, persistence=persistence, lacunarity=lacunarity, rng=self.rng)[:w, :h]
+        field = field - field.min() # shift so minimum = 0
+        peak = field.max()
+
+        # normalise
+        if peak > 0:
+            field = field / peak
+        
+        self.grid.elevation.data[:, :] = height_scale * field
+
 
     def _random_empty_coord(self) -> Coord:
         forbidden = (int(Terrain.DUMP_SITE), int(Terrain.BEDROCK))

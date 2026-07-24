@@ -14,7 +14,7 @@ classes are scaffolds marking where the auction/consensus phases go.
 from __future__ import annotations
 
 from .costs import energy_ij, tau_ij
-from .pathfinding import nearest_work_cell
+from .pathfinding import nearest_work_path, astar, path_climb
 from .terrain import HARDNESS, Terrain
 
 import logging
@@ -117,18 +117,23 @@ def leg_cost(model, robot, task, startPos = None) -> tuple[float, ...]:
     terrain = Terrain(int(model.grid.terrain.data[coord]))
     h = HARDNESS[terrain]
     startPosLeg = robot.cell.coordinate if startPos is None else startPos
-    dig = nearest_work_cell(startPosLeg, [coord],
+
+    dig = nearest_work_path(startPosLeg, [coord],
                             model.grid.width, model.grid.height,
                             model.blocked_cells())
     if dig is None:
         return float("inf"), float("inf"), None # type: ignore
-    p_star, d_task = dig
-    dump = model.dump_work_cell(p_star)
+    p_star, d_task, path_task = dig
+    dump = model.dump_work_path(p_star)
     if dump is None:
         return float("inf"), float("inf"), None # type: ignore
-    dumpCoord, d_dump = dump
+    dumpCoord, d_dump, path_dump = dump
+
+    climbEnergyUsageToTask = path_climb(path_task, model.grid.elevation.data)
+    climbEnergyUsageTaskToDump = path_climb(path_dump, model.grid.elevation.data)
+
     t = tau_ij(robot.spec, task.remaining, h, d_task, d_dump)
-    e = energy_ij(robot.spec, task.remaining, h, d_task, d_dump)
+    e = energy_ij(robot.spec, task.remaining, h, d_task, d_dump, climbEnergyUsageToTask, climbEnergyUsageTaskToDump)
     return t, e, dumpCoord
 
 def bid_value(model, robot, task, w1: float = 1.0, w2: float = 1.0, startPos = None) -> tuple[float, ...]:
