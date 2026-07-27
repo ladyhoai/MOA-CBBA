@@ -21,21 +21,14 @@ from enum import Enum, auto
 
 from mesa.discrete_space import CellAgent
 from .allocation import CBBAAgent
+from .CBPAE import CBPAEAgent
+from.bidding import Stage
 
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
 from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMMA, GAMMA
 
 STUCK_LIMIT = 3
-
-
-class Stage(Enum):
-    IDLE = auto()
-    TO_TASK = auto()
-    DIG = auto()
-    TO_DUMP = auto()
-    UNLOAD = auto()
-
 
 class ExcavatorRobot(CellAgent):
     """One excavation robot. `model` is an ExcavationModel."""
@@ -69,6 +62,7 @@ class ExcavatorRobot(CellAgent):
     # The parameters below are used for CBBA (non-greedy algorithms)
         # Each robot instance will run its own copy of the algorithm because it is decentralised
         self.CBBA = CBBAAgent()
+        self.CBPAE = CBPAEAgent()
 
         # Each robot can hold 4 task at one (but they still have to visit the dump site to complete one task).
         # In the future, if we can combine the excavator and dump truck into a single machine, this variable will
@@ -101,7 +95,7 @@ class ExcavatorRobot(CellAgent):
         self.work_cell, _ = found
         self.task_id = task_id
         task.assigned_to = self.unique_id
-        self.dump_cell = None
+        self.dump_cell = self.model.dump_work_cell(self.work_cell)[0] # We will try to estimate the dump location right away when the task is assigned
         self.stage = Stage.TO_TASK
         self._plan_leg(self.work_cell)
         return True

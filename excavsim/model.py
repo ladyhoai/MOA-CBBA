@@ -161,6 +161,14 @@ class ExcavationModel(Model):
         self.changed_cells.clear()
         self.datacollector.collect(self)
 
+        for r in self.robots:
+            if r.robot_id == 0 and r.task_id is None and len(self.tasks.pending) > 0:
+                j = r.CBPAE.bidTask
+                print(f"R0 idle w/ work: bid={j} "
+                    f"winner={r.CBPAE._winner(j) if j is not None else '-'} "
+                    f"reachable={len(r.CBPAE.biddable_tasks(self, r))} "
+                    f"pending={len(self.tasks.pending)}")
+
         # This is the stopping condition of the whole simulation
         if len(self.tasks.isAllTaskDone) == len(self.tasks._tasks):
             self.running = False  # lets mesa.batch_run stop early
