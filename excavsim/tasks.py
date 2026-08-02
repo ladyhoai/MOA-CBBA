@@ -13,6 +13,7 @@ class Task:
     cell: Coord            # l_j
     volume: float          # V_j (target excavation volume)
     remaining: float = field(init=False)
+    future_remaining: float = field(init=False)
     assigned_to: int | None = None   # robot unique_id, or None
     completed_tick: int | None = None
 
@@ -33,6 +34,7 @@ class TaskRegistry:
 
     def add(self, cell: Coord, volume: float) -> Task:
         t = Task(self._next_id, cell, volume)
+        t.future_remaining = volume
         self._tasks[t.task_id] = t
         self._next_id += 1
         return t

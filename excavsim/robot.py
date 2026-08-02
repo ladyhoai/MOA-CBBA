@@ -15,6 +15,8 @@ Physics rules (v2):
   alternative route is a documented limitation (rare on open maps).
 """
 
+#TODO: LIDARRRRRR RANGE
+
 from __future__ import annotations
 
 from enum import Enum, auto
@@ -28,7 +30,7 @@ from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
 from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMMA, GAMMA
 
-STUCK_LIMIT = 3
+STUCK_LIMIT = 2
 
 class ExcavatorRobot(CellAgent):
     """One excavation robot. `model` is an ExcavationModel."""
@@ -56,6 +58,7 @@ class ExcavatorRobot(CellAgent):
         self._move_credit = 0.0
         self._unload_left = 0
         self._stuck = 0
+        self._timeTaskStart = 0
 
         self.robot_id = len(model.robots)
 
@@ -128,13 +131,16 @@ class ExcavatorRobot(CellAgent):
     # ------------------------------------------------------------------ #
     # movement with collision avoidance
     # ------------------------------------------------------------------ #
+    # TODO: CHANGE THIS TO LIDAR ROBOT DETECTION
     def _other_robot_cells(self) -> set[tuple[int, int]]:
         return {r.cell.coordinate for r in self.model.robots if r is not self}
 
+    # For the planning, I will have to fix it so that the robot does not see all dynamic obstacles,
+    # but only those within its lidar range
     def _plan_leg(self, dest: tuple[int, int],
                   avoid_robots: bool = False) -> None:
         self._dest = dest
-        blocked = self.model.blocked_cells()
+        blocked = self.model.blocked_cells() 
         if avoid_robots:
             blocked = blocked | self._other_robot_cells()
         path = astar(self.cell.coordinate, dest,
@@ -149,7 +155,7 @@ class ExcavatorRobot(CellAgent):
         Returns True once the destination is reached."""
         if not self._path:
             return True
-        occupied = self._other_robot_cells()
+        occupied = self._other_robot_cells() | self.model.dynamics.blocked() # TODO: LIDAR detection update
         self._move_credit += self.spec.v_max
         while self._path and self._move_credit >= 1.0:
             nxt = self._path[0]
@@ -254,12 +260,13 @@ class ExcavatorRobot(CellAgent):
         """
         self._spend(ALPHA, "travel")
         elev = self.model.grid.elevation.data
+        traction = self.model.dynamics.traction_scale()
         # Only charge move energy cost if it is going uphill
         gain = float(elev[to]) - float(elev[frm])
         if gain > 0.0:
             loaded = self.payload > 1e-9
             factor = FULL_PAYLOAD_GAMMA if loaded else 1.0
-            self._spend(GAMMA * gain * factor, "climb")
+            self._spend(GAMMA * gain * traction * factor, "climb")
 
     def _spend(self, amount: float, kind: str = "travel") -> None:
         self.energy_used += amount

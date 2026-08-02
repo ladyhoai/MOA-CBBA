@@ -1,8 +1,13 @@
 from .bidding import leg_cost, bid_value, _better_bid, INF, EPS, NOBID, Stage
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from .model import ExcavationModel
+    from .robot import ExcavatorRobot
+    from .comms import Message
 # run 1 greedy: 135
-# run 2 CBBA: 147
-# run 3 CBPAE: 160
+# run 2 CBBA: 147  ; 2/8: 143
+# run 3 CBPAE: 160 ; 1/8: 154
 class CBPAEAgent():
     def __init__(self) -> None:
         self.winningAgentList = {} # Map: task ID -> Robot ID 
@@ -22,13 +27,14 @@ class CBPAEAgent():
     
     def biddable_tasks(self, model, robot):
         out = []
-        for t in model.tasks.pending:
-            _, _, end = leg_cost(model, robot, t)
-            if end is not None: # if the task is legit and executable
-                out.append(t)
+        for t in model.tasks.all:
+            if t.future_remaining > 0 and not t.done:
+                _, _, end = leg_cost(model, robot, t)
+                if end is not None: # if the task is legit and executable
+                    out.append(t)
         return out
     
-    def compute_bid(self, model, robot):
+    def compute_bid(self, model, robot, lam=0.99, task_reward=10.0):
         best_task, best_bid = None, NOBID
         for t in self.biddable_tasks(model, robot):
             w = self._winner(t.task_id)
@@ -61,7 +67,7 @@ class CBPAEAgent():
             "exec": self.execTask
         })
 
-    def resolveConflicts(self, robot, messages):
+    def resolveConflicts(self, robot: "ExcavatorRobot", messages: "Message"):
         i = robot.robot_id
         changed = False
         for msg in messages:
@@ -98,7 +104,7 @@ class CBPAEAllocator():
     def __init__(self) -> None:
         self.round = 0
 
-    def allocate(self, model) -> None:
+    def allocate(self, model: "ExcavationModel") -> None:
         self.round += 1
         now = self.round
 
@@ -119,7 +125,7 @@ class CBPAEAllocator():
             if j is None:
                 continue
             task = model.tasks.get(j)
-            if task.assigned_to is None and not task.done and r.CBPAE._winner(j) == r.robot_id:
+            if not task.done and r.CBPAE._winner(j) == r.robot_id:
                 if r.assign(j):
                     r.CBPAE.execTask = j
-
+                    task.future_remaining -= r.spec.capacity

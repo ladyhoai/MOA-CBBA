@@ -24,6 +24,7 @@ from mesa.visualization.utils import update_counter
 from excavsim.model import ExcavationModel, TaskMarker
 from excavsim.robot import Stage
 from excavsim.terrain import HARDNESS, Terrain
+from excavsim.dynamics import WEATHER
 
 COMPACT_CSS = """
 .v-application h1, .v-application h2, .v-application h3,
@@ -63,6 +64,19 @@ STAGE_COLORS = {
     Stage.UNLOAD: "#9b59b6",
 }
 
+def _next_task(r):
+    cbba = getattr(r, "CBBA", None)
+    if cbba is not None and getattr(cbba, "path", None):
+        if r.task_id is None and cbba.path:
+            return f"T{cbba.path[0]}"
+        if len(cbba.path) > 1:
+            return f"T{cbba.path[1]}"
+    cbpae = getattr(r, "CBPAE", None)
+    if cbpae is not None and cbpae.bidTask is not None:
+        won = cbpae._winner(cbpae.bidTask) == r.robot_id
+        if won and cbpae.bidTask != r.task_id:
+            return f"T{cbpae.bidTask}"
+    return "-"
 
 def agent_portrayal(agent):
     if isinstance(agent, TaskMarker):
@@ -78,8 +92,7 @@ def layer_portrayal(layer):
     if layer.name != show_layer.value:
         return None
     if layer.name == "terrain":
-        return PropertyLayerStyle(colormap="excav_terrain", vmin=0, vmax=4,
-                                  alpha=0.9, colorbar=False)
+        return PropertyLayerStyle(colormap="excav_terrain", vmin=0, vmax=4, alpha=0.9, colorbar=False)
     if layer.name == "elevation":
         return PropertyLayerStyle(colormap="terrain", alpha=0.9, colorbar=True)
     return None
@@ -96,6 +109,7 @@ def robot_frame(model) -> pd.DataFrame:
             "stage": r.stage.name.lower(),
             "pos": str(r.cell.coordinate),
             "task": "—" if r.task_id is None else f"T{r.task_id}",
+            "next": _next_task(r),
             "battery %": round(100 * r.battery / r.spec.battery, 1),
             "payload": f"{r.payload:.2f}/{r.spec.capacity:.1f}",
             "energy": round(r.energy_used, 2),
@@ -202,7 +216,9 @@ def CellInspector(model):
 def SidePanel(model):
     solara.Style(COMPACT_CSS)
     update_counter.get()
-
+    globals()["_current_model"] = model
+    renderer._post_process_applied = False
+    # print(f"[stash] model id={id(model)} obstacles={len(model.dynamics.obstacles)}")
     def pick(value):
         show_layer.value = value
         refresh_map()
@@ -223,18 +239,38 @@ def SidePanel(model):
             f"&nbsp;|&nbsp; **soil** {soil:.2f} &nbsp;|&nbsp; **energy** {energy:.2f} "
             f"&nbsp;|&nbsp; **idle** {idle:.3f} &nbsp;|&nbsp; **J(x)** {model.current_objective():.1f}")
 
+        # --- Phase 4 dynamics ---
+        d = model.dynamics
+        w = WEATHER[d.weather] if d.weather_enabled else None
+        weather_txt = (f"{d.weather} (sensor ×{w.sensor_scale:.2f}, "
+                       f"traction ×{w.traction_scale:.2f})" if w else "off")
+        hazard_cells = sum(len(h.cells) for h in d.hazards)
+        solara.Markdown(
+            f"**weather** {weather_txt} &nbsp;|&nbsp; "
+            f"**hazards** {len(d.hazards)} ({hazard_cells} cells) &nbsp;|&nbsp; "
+            f"**obstacles** {len(d.obstacles)} &nbsp;|&nbsp; "
+            f"**changed** {len(model.changed_cells)}")
+
         solara.Markdown("**Robots**")
         solara.DataFrame(robot_frame(model), items_per_page=12)
         solara.Markdown("**Tasks**")
-        solara.DataFrame(task_frame(model), items_per_page=10)# ------------------------------------------------------------------ #
-# Assembly
+        solara.DataFrame(task_frame(model), items_per_page=10)# Assembly
 # ------------------------------------------------------------------ #
-model_instance = ExcavationModel(seed=42)
+model_instance = ExcavationModel(seed=42, hazard_rate=0.05, hazard_size=2, obstacle_rate=0.3, hazard_duration=5, max_obstacles=10)
 
 renderer = SpaceRenderer(model_instance, backend="matplotlib")
 renderer.setup_propertylayer(layer_portrayal)
 renderer.setup_agents(agent_portrayal)
 renderer.render()  # REQUIRED: sets the meshes SolaraViz redraws each frame
+
+def _live_model():
+    """The model the UI is currently showing. SidePanel stashes it each
+    render, so this follows Reset even when renderer.space.model is None."""
+    m = globals().get("_current_model")
+    if m is not None:
+        return m
+    space = getattr(renderer, "space", None)
+    return getattr(space, "model", None) or model_instance
 
 def _draw_selection(ax):
     """Red box on the selected cell. Removes any previous box first so
@@ -247,13 +283,47 @@ def _draw_selection(ax):
     rect._gid = _SEL_TAG
     ax.add_patch(rect)
 
+def _draw_hazards(ax):
+    """Red wash on active hazard-zone cells, re-added each frame
+    (the renderer clears patches between frames)."""
+    import matplotlib.pyplot as plt
+    for p in list(ax.patches):
+        if getattr(p, "_gid", None) == "_hazard":
+            p.remove()
+    dyn = getattr(_live_model(), "dynamics", None)
+    if dyn is None:
+        return
+    for hz in dyn.hazards:
+        for (x, y) in hz.cells:
+            rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1,
+                                 facecolor="red", alpha=0.30,
+                                 edgecolor="none", zorder=9)
+            rect._gid = "_hazard"
+            ax.add_patch(rect)
+
+def _draw_obstacles(ax):
+    """drawing red triangles as dynamic obstacles"""
+    for coll in list(ax.collections):
+        if getattr(coll, "_gid", None) == "_obstacles":
+            coll.remove()
+    obs = getattr(_live_model(), "dynamics", None)
+    # print(f"[draw] live model id={id(_live_model())} obstacles={0 if obs is None else len(obs.obstacles)}")
+
+    if obs is None or not obs.obstacles:
+        return
+    xs = [o.cell[0] for o in obs.obstacles]
+    ys = [o.cell[1] for o in obs.obstacles]
+    sc = ax.scatter(xs, ys, marker="^", s=140, c="#e74c3c", edgecolors="black", linewidths=1.0, zorder=11)
+    sc._gid = "_obstacles"
+
 def fit_canvas(ax):
     """Applied once per renderer via post_process — and copy_renderer
     carries post_process across Reset, so the size survives resets."""
     ax.set_aspect("equal")
     ax.get_figure().set_size_inches(10.0, 10.0)
     _draw_selection(ax)
-
+    _draw_hazards(ax)
+    _draw_obstacles(ax)
 
 renderer.post_process = fit_canvas
 fit_canvas(renderer.canvas)      # apply to the initial frame too

@@ -12,7 +12,7 @@ experiments are reproducible.
 """
 
 from __future__ import annotations
-
+import numpy as np
 from mesa import DataCollector, Model
 from mesa.discrete_space import (FixedAgent, OrthogonalMooreGrid,
                                  PropertyLayer)
@@ -24,8 +24,7 @@ from .pathfinding import nearest_work_cell, nearest_work_path
 from .robot import ExcavatorRobot
 from .tasks import TaskRegistry
 from .terrain import T_UNLOAD, Terrain
-
-Coord = tuple[int, int]
+from .dynamics import Coord, DynamicsManager
 
 DEFAULT_SPEC = RobotSpec(capacity=1.5, v_max=1.0, dig_rate=0.5,
                          battery=100.0, sensor_range=8.0)
@@ -53,13 +52,21 @@ class ExcavationModel(Model):
         height: int = 32,
         n_robots: int = 4,
         n_tasks: int = 8,
-        allocator: str = "greedy",
+        allocator: str = "cbpae",
         w1: float = 1.0,
         w2: float = 1.0,
         comm_range: float | None = None,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
         comm_bandwidth: int | None = None,
+
+        hazard_rate: float = 0.05,          # 4.2 zones/tick (0 = off)
+        obstacle_rate: float = 0.3,        # 4.3 obstacles/tick (0 = off)
+        weather_enabled: bool = False,     # 4.4 weather on/off
+        weather_change_rate: float = 0.0,  # 4.4 transitions/tick
+        hazard_duration: int = 5, hazard_size: int = 2,
+        obstacle_duration: int = 60, obstacle_move_prob: float = 0.5,
+        max_obstacles: int = 10,
 
         rock_fraction: float = 0.15,
         gravel_fraction: float = 0.2,
@@ -149,11 +156,21 @@ class ExcavationModel(Model):
                 },
             },
         )
+
+        self.dynamics = DynamicsManager(
+            self, hazard_rate=hazard_rate, obstacle_rate=obstacle_rate,
+            weather_enabled=weather_enabled,
+            weather_change_rate=weather_change_rate,
+            hazard_duration=hazard_duration, hazard_size=hazard_size,
+            obstacle_duration=obstacle_duration,
+            obstacle_move_probability=obstacle_move_prob,
+            max_obstacles=max_obstacles)
         self.datacollector.collect(self)
 
     # -------------------------------------------------------------------- #
     def step(self) -> None:
         self.tick += 1
+        self.dynamics.step(self.tick)
         self.comms.flush_and_deliver(self.tick)    # in-flight messages land
 
         self.allocator.allocate(self)              # bidding + consensus (Greedy allocation)
@@ -219,15 +236,24 @@ class ExcavationModel(Model):
             if found and (best is None or found[1] < best[1]):
                 best = found
         return best
+    
+    def _static_blocked(self) -> set[Coord]:
+        # Permanently impassable cells: bedrock and dumpblocks
+        t = self.grid.terrain.data
+        xs, ys = np.where((t == int(Terrain.BEDROCK)) | (t == int(Terrain.DUMP_SITE)))
+        return set(zip(xs.tolist(), ys.tolist()))
 
     def blocked_cells(self) -> set[Coord]:
         """Impassable cells: bedrock and dump blocks. Phase 4 adds
-        hazards and dynamic obstacles here."""
-        import numpy as np
-        t = self.grid.terrain.data
-        xs, ys = np.where((t == int(Terrain.BEDROCK))
-                          | (t == int(Terrain.DUMP_SITE)))
-        return set(zip(xs.tolist(), ys.tolist()))
+        hazards and dynamic obstacles here.
+        
+        A cell a robot currently OCCUPIES is never reported as blocked,
+        even if a hazard grew over it — otherwise a robot caught inside a
+        new zone could never path out. It can leave; it just can't be
+        newly routed in"""
+
+        occupied = {r.cell.coordinate for r in self.robots}
+        return (self._static_blocked() | self.dynamics.blocked()) - occupied
 
     def _place_dump_block(self) -> None:
         """Stamp a 2x2 DUMP_SITE block at a random free corner."""
