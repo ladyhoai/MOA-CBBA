@@ -20,28 +20,42 @@ from perlin_numpy import generate_fractal_noise_2d
 from .allocation import ALLOCATORS
 from .comms import CommNetwork
 from .costs import RobotSpec, objective
-from .pathfinding import nearest_work_cell, nearest_work_path
+from .fleet import ROBOT_CLASSES, build_fleet, fleet_summary
+from .pathfinding import nearest_work_cell, nearest_work_path, work_candidates
 from .robot import ExcavatorRobot
-from .tasks import TaskRegistry
+from .tasks import MIN_CHUNK, TaskRegistry, chunk_count
 from .terrain import T_UNLOAD, Terrain
 from .dynamics import Coord, DynamicsManager
 
-DEFAULT_SPEC = RobotSpec(capacity=1.5, v_max=1.0, dig_rate=0.5,
-                         battery=100.0, sensor_range=8.0)
+# Kept for anything still importing it; the homogeneous baseline is now
+# fleet_mode="none", which uses the medium class.
+DEFAULT_SPEC = ROBOT_CLASSES["medium"]
 
 
 class TaskMarker(FixedAgent):
-    """Passive agent standing on a task cell so the GUI draws tasks
-    through the standard agent pipeline. Removes itself on completion.
-    No physics: it never moves, digs, or spends energy."""
+    """Passive agent standing on an excavation SITE so the GUI draws it
+    through the standard agent pipeline. Holds all chunks of that site
+    and removes itself only when every chunk is done -- one marker per
+    cell, not one per chunk, or k sharers would stack k markers on the
+    same square. No physics: it never moves, digs, or spends energy."""
 
-    def __init__(self, model, cell, task):
+    def __init__(self, model, cell, chunks):
         super().__init__(model)
         self.cell = cell
-        self.task = task
+        self.chunks = list(chunks)
+        self.task = self.chunks[0]          # back-compat for old callers
+        self.site_id = self.chunks[0].site_id
+
+    @property
+    def remaining(self) -> float:
+        return sum(t.remaining for t in self.chunks)
+
+    @property
+    def done(self) -> bool:
+        return all(t.done for t in self.chunks)
 
     def step(self) -> None:
-        if self.task.done:
+        if self.done:
             self.remove()
 
 
@@ -53,8 +67,13 @@ class ExcavationModel(Model):
         n_robots: int = 4,
         n_tasks: int = 8,
         allocator: str = "cbpae",
-        w1: float = 1.0,
-        w2: float = 1.0,
+        w1: float = 1.5,
+        w2: float = 0.5,
+
+        # --- Phase 2 heterogeneity (Table 1, items 2.1-2.4) --------- #
+        fleet_mode: str = "capacity",   # "none" | "capacity" | "full"
+        fleet_mix: tuple[str, ...] | None = None,   # None -> small/medium/large
+        fleet_shuffle: bool = False,    # False -> deterministic round-robin
         comm_range: float | None = None,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
@@ -76,6 +95,10 @@ class ExcavationModel(Model):
         elevation_persistence: float = 0.5,
 
         task_volume: tuple[float, float] = (1.0, 4.0),
+
+        # --- task decomposition (multi-robot cooperation per cell) --- #
+        max_sharers: int = 1,       # 1 = off, reproduces the old behaviour
+        min_chunk: float = MIN_CHUNK,
         seed: int | None = None,
     ):
         super().__init__(rng=int(seed) if seed is not None else None)
@@ -106,19 +129,28 @@ class ExcavationModel(Model):
 
         # --- tasks ------------------------------------------------------ #
         self.tasks = TaskRegistry()
+        self.max_sharers = int(max_sharers)
+        self.min_chunk = float(min_chunk)
         lo, hi = task_volume
         for _ in range(n_tasks):
             cell = self._random_diggable_coord()
             vol = self.random.uniform(lo, hi)
             self.grid.soil_volume.data[cell] += vol
-            task = self.tasks.add(cell, vol)
-            TaskMarker(self, self.grid[cell], task)
+            k = self._chunk_count(cell, vol)
+            chunks = self.tasks.add(cell, vol, n_chunks=k)
+            TaskMarker(self, self.grid[cell], chunks)
         # print(len(self.tasks.all), "tasks placed")
-        # --- robots ----------------------------------------------------- #
+        # --- robots (Phase 2: one spec per robot, not one for all) ------ #
+        self.fleet_mode = fleet_mode
+        self.fleet_specs = build_fleet(
+            n_robots, mode=fleet_mode, mix=fleet_mix,
+            rng=self.random if fleet_shuffle else None)
+        self.fleet_summary = fleet_summary(self.fleet_specs)
+
         self.robots: list[ExcavatorRobot] = []
-        for _ in range(n_robots):
+        for spec in self.fleet_specs:
             cell = self.grid[self._random_empty_coord()]
-            self.robots.append(ExcavatorRobot(self, cell, DEFAULT_SPEC))
+            self.robots.append(ExcavatorRobot(self, cell, spec))
 
         # Populating the list of task for each robot to prepare for CBBA
         for robot in self.robots:
@@ -153,6 +185,12 @@ class ExcavationModel(Model):
                     "energy_used": "energy_used",
                     "idle_ticks": "idle_ticks",
                     "tasks_completed": "tasks_completed",
+                    # Phase 2: without these you cannot tell whether the
+                    # large machines are hoarding tasks or sitting idle.
+                    # Callables, not attribute names, so this works
+                    # regardless of what properties robot.py exposes.
+                    "robot_class": lambda a: a.spec.name,
+                    "payload_capacity": lambda a: a.spec.capacity,
                 },
             },
         )
@@ -302,6 +340,22 @@ class ExcavationModel(Model):
         
         self.grid.elevation.data[:, :] = height_scale * field
 
+
+    def _chunk_count(self, cell: Coord, volume: float) -> int:
+        """Split factor for one site. Uses only STATIC blocking, since
+        hazards and obstacles are transient and the split is fixed at
+        creation time -- a chunk count that changed with the weather
+        would keep invalidating the BAM."""
+        free = len(work_candidates([cell], self.grid.width, self.grid.height,
+                                   self._static_blocked()))
+        return chunk_count(volume, self.max_sharers, free, self.min_chunk)
+
+    def claimed_work_cells(self, exclude=None) -> set[Coord]:
+        """Work cells other robots have already committed to. Passed to
+        nearest_work_cell at assignment so two robots sharing a site do
+        not both target the same dig position."""
+        return {r.work_cell for r in self.robots
+                if r is not exclude and r.work_cell is not None}
 
     def _random_empty_coord(self) -> Coord:
         forbidden = (int(Terrain.DUMP_SITE), int(Terrain.BEDROCK))

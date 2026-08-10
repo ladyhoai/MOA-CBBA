@@ -67,10 +67,12 @@ class ExcavatorRobot(CellAgent):
         self.CBBA = CBBAAgent()
         self.CBPAE = CBPAEAgent()
 
-        # Each robot can hold 4 task at one (but they still have to visit the dump site to complete one task).
-        # In the future, if we can combine the excavator and dump truck into a single machine, this variable will
-        # indicate the maximum payload of the machine. (Still to be decided)
-        self.capacity = 6
+        # Max number of tasks in a CBBA bundle (L_i). RENAMED from
+        # `capacity`, which collided with spec.capacity (payload, C_i).
+        # The two are unrelated: this is an algorithm parameter, that is
+        # a physical property, and with a heterogeneous fleet the
+        # collision silently produces wrong bundle limits.
+        self.bundle_limit = 6
 
         # communication (Phase 6): thin wrappers over the model's network
     # ------------------------------------------------------------------ #
@@ -87,14 +89,26 @@ class ExcavatorRobot(CellAgent):
     # ------------------------------------------------------------------ #
     def assign(self, task_id: int) -> bool:
         """Take task j. Returns False (no state change) if no dig
-        position is reachable; allocators should then skip the task."""
+        position is reachable; allocators should then skip the task.
+
+        Work cells claimed by other robots are excluded: with task
+        decomposition, sibling chunks share a cell l_j, so without this
+        two sharers pick the same p*, collide, and burn STUCK_LIMIT
+        ticks each before _reroute untangles them."""
         task = self.model.tasks.get(task_id)
+        claimed = self.model.claimed_work_cells(exclude=self)
         found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                   self.model.grid.width,
                                   self.model.grid.height,
-                                  self.model.blocked_cells())
-        if found is None:
-            return False
+                                  self.model.blocked_cells(),
+                                  claimed)
+        if found is None:   # fall back to an uncontended search rather
+            found = nearest_work_cell(self.cell.coordinate, [task.cell],
+                                      self.model.grid.width,
+                                      self.model.grid.height,
+                                      self.model.blocked_cells())
+            if found is None:
+                return False
         self.work_cell, _ = found
         self.task_id = task_id
         task.assigned_to = self.unique_id
@@ -269,5 +283,20 @@ class ExcavatorRobot(CellAgent):
             self._spend(GAMMA * gain * traction * factor, "climb")
 
     def _spend(self, amount: float, kind: str = "travel") -> None:
+        """Single point where energy leaves the battery, so the Phase 2
+        drain multiplier is applied once and cannot drift out of sync
+        with energy_ij (which scales its whole return value)."""
+        amount *= self.spec.drain_scale
         self.energy_used += amount
         self.battery = max(0.0, self.battery - amount)
+
+    # ------------------------------------------------------------------ #
+    @property
+    def payload_capacity(self) -> float:
+        """C_i. Exposed for the DataCollector and the GUI inspector —
+        `capacity` on this object is now the bundle limit."""
+        return self.spec.capacity
+
+    @property
+    def robot_class(self) -> str:
+        return self.spec.name

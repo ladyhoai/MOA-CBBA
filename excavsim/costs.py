@@ -20,18 +20,22 @@ from .terrain import ALPHA, BETA, T_UNLOAD, GAMMA, FULL_PAYLOAD_GAMMA
 
 @dataclass(frozen=True)
 class RobotSpec:
-    """Immutable properties S_i (Phase 1 subset; extend in Phase 2)."""
-
+    """Immutable properties S_i (Phase 1 subset; extended in Phase 2)."""
+ 
     capacity: float      # C_i, payload capacity
     v_max: float         # cells per tick
     dig_rate: float      # rho_i, volume/(hardness*tick)
     battery: float       # B_i, total battery capacity
     sensor_range: float  # sigma_i (unused until Phase 3)
-
+    # --- Phase 2 (Table 1, item 2.4) -------------------------------- #
+    drain_scale: float = 1.0   # battery drain multiplier; heavy machines
+                               # spend more per step travelled and per
+                               # dig tick. 1.0 reproduces Phase 1 exactly.
+    name: str = "default"      # robot class label, for reporting
 
 def n_trips(volume: float, capacity: float) -> int:
     """Eq. (3): n_ij = ceil(V_j / C_i)."""
-    return math.ceil(volume / capacity)
+    return max(1, math.ceil(volume / capacity - 1e-9))
 
 # I think the n_trips here should not be taken into consideration. Because if we do that, it is like assigning 1 robot to that entire task which consists of 
 # multiple trips to excavate that cell to target depth. We assigned it to 1 for now!!!!!!!!. 

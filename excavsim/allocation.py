@@ -336,7 +336,7 @@ class CBBAAgent:
     
         _dbg(1, "=" * 78)
         _dbg(1, f"{tag} createBundle ENTRY")
-        _dbg(1, f"{tag}   capacity        : {robot.capacity}")
+        _dbg(1, f"{tag}   capacity        : {robot.bundle_limit}")
         _dbg(1, f"{tag}   bundle in       : {self.bundle}")
         _dbg(1, f"{tag}   path   in       : {currentPath}")
         _dbg(1, f"{tag}   y (winning bids): {_fmt_map(currentWinningBidList)}")
@@ -351,7 +351,7 @@ class CBBAAgent:
             _dbg(1, f"{tag}   note: no y entry for {missing_y} -> treated as -inf (nobid)")
     
         iteration = 0
-        while len(self.bundle) < robot.capacity:
+        while len(self.bundle) < robot.bundle_limit:
             allTaskIDs = set(self.bundle)
 
             # Create a list of tasks that are not added to the bundle of the current robot yet
@@ -429,7 +429,7 @@ class CBBAAgent:
     
             if Ji is None:
                 _dbg(1, f"{tag} STOP: no task beat its incumbent bid "
-                        f"(bundle size {len(self.bundle)}/{robot.capacity})")
+                        f"(bundle size {len(self.bundle)}/{robot.bundle_limit})")
                 break
     
             # Adding the task to the bundle, path, bid list and winning agent list
@@ -446,12 +446,12 @@ class CBBAAgent:
             _check_consistency(tag, self.bundle, currentPath, f"after adding {Ji}")
     
             iteration += 1
-            if iteration > len(self.task_list) + robot.capacity + 1:
+            if iteration > len(self.task_list) + robot.bundle_limit + 1:
                 _dbg(1, f"{tag} !! ABORT: while-loop is not terminating")
                 break
     
-        if len(self.bundle) >= robot.capacity:
-            _dbg(1, f"{tag} STOP: capacity reached ({len(self.bundle)}/{robot.capacity})")
+        if len(self.bundle) >= robot.bundle_limit:
+            _dbg(1, f"{tag} STOP: capacity reached ({len(self.bundle)}/{robot.bundle_limit})")
 
         # Update the internal class variable to reflect the new changes
         self.winningAgentList = currentWinningAgentList

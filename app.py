@@ -106,6 +106,7 @@ def robot_frame(model) -> pd.DataFrame:
     for i, r in enumerate(model.robots):
         rows.append({
             "robot": i,
+            "class": r.spec.name,          # Phase 2: which machine is this?
             "stage": r.stage.name.lower(),
             "pos": str(r.cell.coordinate),
             "task": "—" if r.task_id is None else f"T{r.task_id}",
@@ -133,8 +134,10 @@ def task_frame(model) -> pd.DataFrame:
             status = "pending"
         rows.append({
             "task": f"T{t.task_id}",
+            "site": f"S{t.site_id}",
             "cell": str(t.cell),
             "remaining": f"{t.remaining:.2f}/{t.volume:.2f}",
+            "sharers": model.tasks.sharers(t.site_id),
             "status": status,
         })
     return pd.DataFrame(rows)
@@ -178,6 +181,20 @@ def CellInspector(model):
         ("traversable", "no" if blocked else "yes"),
     ]
 
+    here = model.tasks.at_cell(c)
+    if here:
+        site = here[0].site_id
+        uid_to_idx0 = {r.unique_id: i for i, r in enumerate(model.robots)}
+        who = [f"R{uid_to_idx0[t.assigned_to]}" for t in here
+               if t.assigned_to is not None and t.assigned_to in uid_to_idx0]
+        rows += [
+            ("site", f"S{site}  ({len(here)} chunk"
+                     f"{'s' if len(here) > 1 else ''})"),
+            ("site remaining",
+             f"{model.tasks.site_remaining(site):.2f} / {here[0].site_volume:.2f}"),
+            ("sharing robots", ", ".join(who) if who else "—"),
+        ]
+
     task = next((t for t in model.tasks.all if t.cell == c), None)
     if task is not None:
         uid_to_idx = {r.unique_id: i for i, r in enumerate(model.robots)}
@@ -199,7 +216,11 @@ def CellInspector(model):
             ("robot", f"R{robot.robot_id}"),
             ("stage", robot.stage.name.lower()),
             ("target task", "—" if robot.task_id is None else f"T{robot.task_id}"),
+            ("class", robot.spec.name),
             ("payload", f"{robot.payload:.2f} / {robot.spec.capacity:.1f}"),
+            ("v_max / dig rate",
+             f"{robot.spec.v_max:.2f} / {robot.spec.dig_rate:.2f}"),
+            ("drain scale", f"x{robot.spec.drain_scale:.2f}"),
             ("battery", f"{100 * robot.battery / robot.spec.battery:.1f} %"),
             ("energy (tr/cl/dig)",
              f"{robot.energy_travel:.2f} / {robot.energy_climb:.2f} / {robot.energy_dig:.2f}"),
@@ -230,12 +251,14 @@ def SidePanel(model):
                                    on_value=pick, dense=True)
 
         done = sum(t.done for t in model.tasks.all)
+        sites_done = sum(model.tasks.site_done(s) for s in model.tasks.sites)
         soil = sum(t.volume - t.remaining for t in model.tasks.all)
         energy = sum(r.energy_used for r in model.robots)
         idle = (sum(r.idle_ticks for r in model.robots)
                 / max(1, model.tick * len(model.robots)))
         solara.Markdown(
-            f"**tick** {model.tick} &nbsp;|&nbsp; **tasks** {done}/{len(model.tasks.all)} "
+            f"**tick** {model.tick} &nbsp;|&nbsp; **sites** {sites_done}/{model.tasks.n_sites} "
+            f"&nbsp;|&nbsp; **chunks** {done}/{len(model.tasks.all)} "
             f"&nbsp;|&nbsp; **soil** {soil:.2f} &nbsp;|&nbsp; **energy** {energy:.2f} "
             f"&nbsp;|&nbsp; **idle** {idle:.3f} &nbsp;|&nbsp; **J(x)** {model.current_objective():.1f}")
 
@@ -251,12 +274,13 @@ def SidePanel(model):
             f"**obstacles** {len(d.obstacles)} &nbsp;|&nbsp; "
             f"**changed** {len(model.changed_cells)}")
 
-        solara.Markdown("**Robots**")
+        mix = " ".join(f"{k}x{v}" for k, v in sorted(model.fleet_summary.items()))
+        solara.Markdown(f"**Robots** &nbsp; _fleet: {model.fleet_mode} ({mix})_")
         solara.DataFrame(robot_frame(model), items_per_page=12)
         solara.Markdown("**Tasks**")
         solara.DataFrame(task_frame(model), items_per_page=10)# Assembly
 # ------------------------------------------------------------------ #
-model_instance = ExcavationModel(seed=42, hazard_rate=0.05, hazard_size=2, obstacle_rate=0.3, hazard_duration=5, max_obstacles=10)
+model_instance = ExcavationModel(seed=42, hazard_rate=0.05, hazard_size=2, obstacle_rate=0.3, hazard_duration=5, max_obstacles=10, max_sharers=4)
 
 renderer = SpaceRenderer(model_instance, backend="matplotlib")
 renderer.setup_propertylayer(layer_portrayal)
@@ -331,14 +355,21 @@ fit_canvas(renderer.canvas)      # apply to the initial frame too
 model_params = {
     "seed": {"type": "InputText", "value": 42, "label": "random seed"},
     "n_robots": Slider("robots", 4, 1, 12, 1),
-    "n_tasks": Slider("tasks", 8, 1, 30, 1),
+    "n_tasks": Slider("sites", 8, 1, 30, 1),
+    "max_sharers": Slider("max robots per site (1 = off)", 1, 1, 4, 1),
     "rock_fraction": Slider("rock fraction", 0.15, 0.0, 0.5, 0.05),
     "gravel_fraction": Slider("gravel fraction", 0.20, 0.0, 0.5, 0.05),
     "allocator": {
         "type": "Select",
         "value": "greedy",
         "values": ["greedy", "cbba", "cbpae", "moa-cbba"],
-        "label": "allocator (only greedy implemented so far)",
+        "label": "allocator (moa-cbba not implemented yet)",
+    },
+    "fleet_mode": {
+        "type": "Select",
+        "value": "capacity",
+        "values": ["none", "capacity", "full"],
+        "label": "fleet heterogeneity (Phase 2)",
     },
     "width": 32,
     "height": 32,
