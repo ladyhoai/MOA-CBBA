@@ -24,13 +24,11 @@ class Task:
     site_id: int = 0       # which excavation site this chunk belongs to
     site_volume: float = 0.0   # total across all chunks at the site
     remaining: float = field(init=False)
-    future_remaining: float = field(init=False)
-    assigned_to: int | None = None   # robot unique_id, or None
+    assigned_to: int | None = None   # robot_id, or None
     completed_tick: int | None = None
  
     def __post_init__(self) -> None:
         self.remaining = self.volume
-        self.future_remaining = self.volume
  
     @property
     def done(self) -> bool:
@@ -146,6 +144,8 @@ class TaskRegistry:
         return [t for t in self._tasks.values() if not t.done]
  
     @property
-    def isAllTaskDone(self) -> list[Task]:
-        return [t for t in self._tasks.values()
-                if t.done and t.completed_tick is not None]
+    def all_done(self) -> bool:
+        """Every chunk finished and stamped. Was `isAllTaskDone`, which
+        returned a list and read as a boolean at every call site."""
+        return all(t.done and t.completed_tick is not None
+                   for t in self._tasks.values())

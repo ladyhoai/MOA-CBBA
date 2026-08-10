@@ -22,7 +22,7 @@ from mesa.visualization.components import AgentPortrayalStyle, PropertyLayerStyl
 from mesa.visualization.utils import update_counter
 
 from excavsim.model import ExcavationModel, TaskMarker
-from excavsim.robot import Stage
+from excavsim.bidding import Stage
 from excavsim.terrain import HARDNESS, Terrain
 from excavsim.dynamics import WEATHER
 
@@ -73,8 +73,8 @@ def _next_task(r):
             return f"T{cbba.path[1]}"
     cbpae = getattr(r, "CBPAE", None)
     if cbpae is not None and cbpae.bidTask is not None:
-        won = cbpae._winner(cbpae.bidTask) == r.robot_id
-        if won and cbpae.bidTask != r.task_id:
+        if cbpae._winner(cbpae.bidTask) == r.robot_id \
+                and cbpae.bidTask != r.task_id:
             return f"T{cbpae.bidTask}"
     return "-"
 
@@ -121,15 +121,14 @@ def robot_frame(model) -> pd.DataFrame:
 
 
 def task_frame(model) -> pd.DataFrame:
-    uid_to_idx = {r.unique_id: i for i, r in enumerate(model.robots)}
     rows = []
     for t in model.tasks.all:
         if t.done and t.completed_tick is not None:
             status = f"done @ {t.completed_tick}"
         elif t.done:
-            status = f"finishing (robot {uid_to_idx.get(t.assigned_to, '?')})"
+            status = f"finishing (robot {t.assigned_to})"
         elif t.assigned_to is not None:
-            status = f"robot {uid_to_idx.get(t.assigned_to, '?')}"
+            status = f"robot {t.assigned_to}"
         else:
             status = "pending"
         rows.append({
@@ -184,9 +183,8 @@ def CellInspector(model):
     here = model.tasks.at_cell(c)
     if here:
         site = here[0].site_id
-        uid_to_idx0 = {r.unique_id: i for i, r in enumerate(model.robots)}
-        who = [f"R{uid_to_idx0[t.assigned_to]}" for t in here
-               if t.assigned_to is not None and t.assigned_to in uid_to_idx0]
+        who = [f"R{t.assigned_to}" for t in here
+               if t.assigned_to is not None]
         rows += [
             ("site", f"S{site}  ({len(here)} chunk"
                      f"{'s' if len(here) > 1 else ''})"),
@@ -197,11 +195,10 @@ def CellInspector(model):
 
     task = next((t for t in model.tasks.all if t.cell == c), None)
     if task is not None:
-        uid_to_idx = {r.unique_id: i for i, r in enumerate(model.robots)}
         if task.done and task.completed_tick is not None:
             status = f"done @ {task.completed_tick}"
         elif task.assigned_to is not None:
-            status = f"robot {uid_to_idx.get(task.assigned_to, '?')}"
+            status = f"robot {task.assigned_to}"
         else:
             status = "pending"
         rows += [
@@ -226,8 +223,13 @@ def CellInspector(model):
              f"{robot.energy_travel:.2f} / {robot.energy_climb:.2f} / {robot.energy_dig:.2f}"),
             ("metres climbed", f"{robot.metres_climbed:.2f}"),
             ("wait ticks", robot.wait_ticks),
-            ("bundle", robot.CBBA.bundle or "—"),
-            ("path", robot.CBBA.path or "—"),
+            ("distance", f"{robot.distance_travelled:.0f} steps"),
+            ("bundle b_i", robot.CBBA.bundle or "—"),
+            ("path p_i", robot.CBBA.path or "—"),
+            ("cbpae bid", "—" if robot.CBPAE.bidTask is None
+                          else f"T{robot.CBPAE.bidTask}"),
+            ("cbpae exec", "—" if robot.CBPAE.execTask is None
+                           else f"T{robot.CBPAE.execTask}"),
         ]
 
     body = "\n".join(f"| {k} | {v} |" for k, v in rows)
@@ -280,7 +282,12 @@ def SidePanel(model):
         solara.Markdown("**Tasks**")
         solara.DataFrame(task_frame(model), items_per_page=10)# Assembly
 # ------------------------------------------------------------------ #
-model_instance = ExcavationModel(seed=42, hazard_rate=0.05, hazard_size=2, obstacle_rate=0.3, hazard_duration=5, max_obstacles=10, max_sharers=4)
+model_instance = ExcavationModel(
+    seed=42, allocator="cbpae", max_sharers=4,
+    # Phase 4 is off in the model defaults; the dashboard turns it on so
+    # there is something to look at.
+    hazard_rate=0.05, hazard_size=2, hazard_duration=5,
+    obstacle_rate=0.3, max_obstacles=10)
 
 renderer = SpaceRenderer(model_instance, backend="matplotlib")
 renderer.setup_propertylayer(layer_portrayal)

@@ -13,24 +13,29 @@ Physics rules (v2):
   consecutive blocked ticks, re-plan the current leg around the robots
   occupying the way. Head-on deadlock in a 1-wide corridor with no
   alternative route is a documented limitation (rare on open maps).
+
+Energy is accounted in three buckets (travel / climb / dig) as well as
+in the total, because "large robots burn more" and "large robots are
+sent uphill more" are different findings and the total cannot tell them
+apart. The GUI inspector reads these.
 """
 
-#TODO: LIDARRRRRR RANGE
+# TODO: LIDAR range -- _other_robot_cells currently gives every robot
+# omniscient knowledge of every other robot's position.
 
 from __future__ import annotations
 
-from enum import Enum, auto
-
 from mesa.discrete_space import CellAgent
-from .allocation import CBBAAgent
-from .CBPAE import CBPAEAgent
-from.bidding import Stage
 
+from .allocation import CBBAAgent
+from .bidding import Stage
+from .CBPAE import CBPAEAgent
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
 from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMMA, GAMMA
 
 STUCK_LIMIT = 2
+
 
 class ExcavatorRobot(CellAgent):
     """One excavation robot. `model` is an ExcavationModel."""
@@ -44,9 +49,15 @@ class ExcavatorRobot(CellAgent):
         self.payload = 0.0
         # bookkeeping / metrics
         self.energy_used = 0.0
+        self.energy_travel = 0.0     # ALPHA per grid step
+        self.energy_climb = 0.0      # GAMMA per metre gained
+        self.energy_dig = 0.0        # BETA per dig tick
+        self.metres_climbed = 0.0
+        self.distance_travelled = 0.0   # grid steps; Das et al. Fig. 4
         self.idle_ticks = 0
         self.busy_ticks = 0
         self.tasks_completed = 0
+        self.tasks_dropped = 0
         self.wait_ticks = 0        # ticks spent blocked by other robots
         # execution state
         self.stage = Stage.IDLE
@@ -58,23 +69,24 @@ class ExcavatorRobot(CellAgent):
         self._move_credit = 0.0
         self._unload_left = 0
         self._stuck = 0
-        self._timeTaskStart = 0
 
         self.robot_id = len(model.robots)
 
-    # The parameters below are used for CBBA (non-greedy algorithms)
-        # Each robot instance will run its own copy of the algorithm because it is decentralised
+        # Decentralised allocators: each robot runs its own copy.
         self.CBBA = CBBAAgent()
         self.CBPAE = CBPAEAgent()
 
-        # Max number of tasks in a CBBA bundle (L_i). RENAMED from
-        # `capacity`, which collided with spec.capacity (payload, C_i).
-        # The two are unrelated: this is an algorithm parameter, that is
-        # a physical property, and with a heterogeneous fleet the
-        # collision silently produces wrong bundle limits.
+        # Max number of tasks in a CBBA bundle (L_t in Choi et al.).
+        # RENAMED from `capacity`, which collided with spec.capacity
+        # (payload, C_i). The two are unrelated: this is an algorithm
+        # parameter, that is a physical property, and with a
+        # heterogeneous fleet the collision silently produced wrong
+        # bundle limits. Setting this to 1 reduces CBBA to CBAA
+        # (Choi et al. Sec. IV-B) -- that is the decomposition ablation.
         self.bundle_limit = 6
 
-        # communication (Phase 6): thin wrappers over the model's network
+    # ------------------------------------------------------------------ #
+    # communication (Phase 6): thin wrappers over the model's network
     # ------------------------------------------------------------------ #
     def send(self, payload: dict, to=None) -> None:
         """Queue a message; to=None broadcasts to robots in range."""
@@ -89,13 +101,16 @@ class ExcavatorRobot(CellAgent):
     # ------------------------------------------------------------------ #
     def assign(self, task_id: int) -> bool:
         """Take task j. Returns False (no state change) if no dig
-        position is reachable; allocators should then skip the task.
+        position OR no dump position is reachable; allocators should
+        then skip the task.
 
         Work cells claimed by other robots are excluded: with task
         decomposition, sibling chunks share a cell l_j, so without this
         two sharers pick the same p*, collide, and burn STUCK_LIMIT
         ticks each before _reroute untangles them."""
         task = self.model.tasks.get(task_id)
+        if task.done or task.assigned_to is not None:
+            return False
         claimed = self.model.claimed_work_cells(exclude=self)
         found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                   self.model.grid.width,
@@ -109,13 +124,46 @@ class ExcavatorRobot(CellAgent):
                                       self.model.blocked_cells())
             if found is None:
                 return False
-        self.work_cell, _ = found
+        work_cell, _ = found
+        # q* is chosen once, from p*, at assignment time -- but it can
+        # legitimately fail (no dump reachable), and indexing [0] on the
+        # None return crashed the allocator instead of skipping the task.
+        dump = self.model.dump_work_cell(work_cell)
+        if dump is None:
+            return False
+
+        self.work_cell = work_cell
+        self.dump_cell = dump[0]
         self.task_id = task_id
-        task.assigned_to = self.unique_id
-        self.dump_cell = self.model.dump_work_cell(self.work_cell)[0] # We will try to estimate the dump location right away when the task is assigned
+        task.assigned_to = self.robot_id
         self.stage = Stage.TO_TASK
         self._plan_leg(self.work_cell)
         return True
+
+    def abandon_task(self) -> None:
+        """Drop the current task and return it to the pool.
+
+        Das et al. Sec. 3.7.4: a robot may stop only during the FIRST
+        phase of execution (travelling to the task), so that the task
+        state is unchanged and the task stays reallocatable. Callers
+        must check `can_abandon` first."""
+        if self.task_id is None:
+            return
+        task = self.model.tasks.get(self.task_id)
+        task.assigned_to = None
+        self.tasks_dropped += 1
+        self.task_id = None
+        self.work_cell = None
+        self.dump_cell = None
+        self._path = []
+        self.stage = Stage.IDLE
+
+    @property
+    def can_abandon(self) -> bool:
+        """Phase 1 of execution only, and nothing in the hopper."""
+        return (self.task_id is not None
+                and self.stage is Stage.TO_TASK
+                and self.payload <= 1e-9)
 
     # ------------------------------------------------------------------ #
     # per-tick execution
@@ -138,9 +186,9 @@ class ExcavatorRobot(CellAgent):
             self._unload_tick()
 
     def updateTaskList(self, taskList) -> None:
-        """Update the task list for the class instances of all allocators. Call this function in model.py 
-        when new tasks is created at the beginning of the simulation. taskList is a list in TaskRegistry"""
-        self.CBBA.task_list = taskList
+        """Seed both allocators' task lists. Called from model.py once
+        the registry is populated."""
+        self.CBBA.task_list = list(taskList)
 
     # ------------------------------------------------------------------ #
     # movement with collision avoidance
@@ -149,12 +197,10 @@ class ExcavatorRobot(CellAgent):
     def _other_robot_cells(self) -> set[tuple[int, int]]:
         return {r.cell.coordinate for r in self.model.robots if r is not self}
 
-    # For the planning, I will have to fix it so that the robot does not see all dynamic obstacles,
-    # but only those within its lidar range
     def _plan_leg(self, dest: tuple[int, int],
                   avoid_robots: bool = False) -> None:
         self._dest = dest
-        blocked = self.model.blocked_cells() 
+        blocked = self.model.blocked_cells()
         if avoid_robots:
             blocked = blocked | self._other_robot_cells()
         path = astar(self.cell.coordinate, dest,
@@ -169,7 +215,7 @@ class ExcavatorRobot(CellAgent):
         Returns True once the destination is reached."""
         if not self._path:
             return True
-        occupied = self._other_robot_cells() | self.model.dynamics.blocked() # TODO: LIDAR detection update
+        occupied = self._other_robot_cells() | self.model.dynamics.blocked()
         self._move_credit += self.spec.v_max
         while self._path and self._move_credit >= 1.0:
             nxt = self._path[0]
@@ -186,7 +232,7 @@ class ExcavatorRobot(CellAgent):
             self.move_to(self.model.grid[nxt])
             self._move_credit -= 1.0
             self._stuck = 0
-            self._spend_move(currentPosition, nxt)  # travel energy per grid step (Eq. 5)
+            self._spend_move(currentPosition, nxt)  # Eq. 5 travel term
         return not self._path
 
     # ------------------------------------------------------------------ #
@@ -231,7 +277,7 @@ class ExcavatorRobot(CellAgent):
             self.payload += dv
             task.remaining -= dv
             self.model.grid.soil_volume.data[coord] -= dv
-            self._spend(BETA)  # dig energy per tick (see costs.py)
+            self._spend(BETA, "dig")  # dig energy per tick (see costs.py)
         if task.done or self.payload >= self.spec.capacity - 1e-9:
             self._go_dump()
 
@@ -267,17 +313,19 @@ class ExcavatorRobot(CellAgent):
         self.dump_cell = None
         self.stage = Stage.IDLE  # Algorithm 1, line 11: x_ij <- 0
 
+    # ------------------------------------------------------------------ #
+    # energy
+    # ------------------------------------------------------------------ #
     def _spend_move(self, frm, to) -> None:
-        """ Only elevation GAINED costs energy
-        (descent is free), and climbing loaded costs
-        LOADED_CLIMB_FACTOR times more.
-        """
+        """Only elevation GAINED costs energy (descent is free), and
+        climbing loaded costs FULL_PAYLOAD_GAMMA times more."""
+        self.distance_travelled += 1.0
         self._spend(ALPHA, "travel")
         elev = self.model.grid.elevation.data
         traction = self.model.dynamics.traction_scale()
-        # Only charge move energy cost if it is going uphill
         gain = float(elev[to]) - float(elev[frm])
         if gain > 0.0:
+            self.metres_climbed += gain
             loaded = self.payload > 1e-9
             factor = FULL_PAYLOAD_GAMMA if loaded else 1.0
             self._spend(GAMMA * gain * traction * factor, "climb")
@@ -285,15 +333,21 @@ class ExcavatorRobot(CellAgent):
     def _spend(self, amount: float, kind: str = "travel") -> None:
         """Single point where energy leaves the battery, so the Phase 2
         drain multiplier is applied once and cannot drift out of sync
-        with energy_ij (which scales its whole return value)."""
+        with energy_ij (which also scales its whole return value)."""
         amount *= self.spec.drain_scale
         self.energy_used += amount
+        if kind == "climb":
+            self.energy_climb += amount
+        elif kind == "dig":
+            self.energy_dig += amount
+        else:
+            self.energy_travel += amount
         self.battery = max(0.0, self.battery - amount)
 
     # ------------------------------------------------------------------ #
     @property
     def payload_capacity(self) -> float:
-        """C_i. Exposed for the DataCollector and the GUI inspector —
+        """C_i. Exposed for the DataCollector and the GUI inspector --
         `capacity` on this object is now the bundle limit."""
         return self.spec.capacity
 

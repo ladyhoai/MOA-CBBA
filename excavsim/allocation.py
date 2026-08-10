@@ -1,35 +1,55 @@
 """Pluggable task allocators.
 
-Every allocator implements `allocate(model)`: inspect idle robots and
-pending tasks, then call `robot.assign(task_id)` for each new pairing.
-This is the seam where CBBA, CBPAE and MOA-CBBA slot in — the model and
-metrics code never change when you swap algorithms, which is what makes
-the three-way comparison clean in batch runs.
+Every allocator implements `allocate(model)`: inspect robots and tasks,
+then call `robot.assign(task_id)` for each new pairing. This is the seam
+where CBBA, CBPAE and MOA-CBBA slot in -- the model and metrics code
+never change when you swap algorithms, which is what makes the
+three-way comparison clean in batch runs.
 
-GreedyAllocator is a working baseline (your Fig. 4 "Very Greedy",
-upgraded to A* distances and the full Eq. 4/5 bid). The CBBA-family
-classes are scaffolds marking where the auction/consensus phases go.
+CBBA here follows Choi, Brunet & How (2009). Four things previously
+diverged from the paper and are fixed:
+
+  1. The s vector (Eq. 5) was broadcast but never merged, so every
+     s_im stayed at -1 and the `newer(m)` clause of Table I was
+     effectively hardcoded True. Harmless at D = 1, wrong the moment
+     comm_range is finite -- i.e. exactly when Phase 6 turns on.
+  2. The score was not DMG and marginal gains could go negative, which
+     breaks the convergence proof. The score now discounts by the
+     accrued objective, making every gain strictly positive (Sec. VI-C),
+     and Lemma 4's clamp c_ij(t) = min(c_ij(t), c_ij(t-1)) is applied
+     as the belt-and-braces guarantee for non-DMG scores.
+  3. Bundles were wiped every call and only path[0] was ever assigned,
+     which is the L_t = 1 case -- i.e. CBAA, not CBBA (Sec. IV-B).
+     Bundles now persist across ticks. Set robot.bundle_limit = 1 to get
+     the CBAA behaviour back as an ablation.
+  4. MAX_ROUNDS was an arbitrary 20; Theorem 1 bounds convergence at
+     N_min * D.
 """
 
 from __future__ import annotations
 
-from .costs import energy_ij, tau_ij
-from .pathfinding import nearest_work_path, astar, path_climb
-from .terrain import HARDNESS, Terrain
-
 import logging
 import os
+from collections import deque
 from pathlib import Path
 
+from .bidding import (EPS, INF, NOBID, Stage, _better_bid, bid_value,
+                      leg_cost)
 from .CBPAE import CBPAEAllocator
 from .MOACBBA import MOACBBAAllocator
 
-INF = float("inf")
-EPS = 1e-9
-NOBID = float("-inf") 
+# A task under execution cannot be taken away mid-dig, so its owner
+# advertises an unbeatable (but finite -- inf poisons the arithmetic)
+# winning bid. This is the CBBA-side equivalent of the EXEC status in
+# CBPAE's execution-status vector.
+LOCKED_BID = 1e9
 
-############### Below are helper functions for debugging and formatting ###############
-CBBA_VERBOSE = 1
+# Time-discounted reward, Choi et al. Eq. (11).
+LAMBDA = 0.99
+TASK_REWARD = 10.0
+
+############### helper functions for debugging and formatting ###############
+CBBA_VERBOSE = int(os.environ.get("CBBA_VERBOSE", "1"))
 CBBA_LOG_FILE = os.environ.get("CBBA_LOG_FILE", "cbba_debug.log")
 
 _log = logging.getLogger("cbba")
@@ -48,16 +68,15 @@ def _dbg(level, *args):
     if CBBA_VERBOSE >= level:
         _log.debug(" ".join(str(a) for a in args))
 
- 
- 
+
 def _fmt_num(v):
     if v == float("inf"):
         return "   +inf"
     if v == float("-inf"):
         return "   -inf"
     return f"{v:7.3f}"
- 
- 
+
+
 def _fmt_map(d):
     if not d:
         return "{}"
@@ -66,10 +85,10 @@ def _fmt_map(d):
         v = d[k]
         items.append(f"{k}: {_fmt_num(v) if isinstance(v, float) else v}")
     return "{" + ", ".join(items) + "}"
- 
- 
+
+
 def _check_consistency(tag, bundle, path, where):
-    """The invariant CBBA relies on: path is a permutation of bundle, no repeats."""
+    """The invariant CBBA relies on: path is a permutation of bundle."""
     ok = True
     if len(set(path)) != len(path):
         dupes = sorted({t for t in path if path.count(t) > 1})
@@ -86,16 +105,46 @@ def _check_consistency(tag, bundle, path, where):
         ok = False
     return ok
 
-######################### 
+
+def network_diameter(model) -> int:
+    """D in Choi et al. Eq. (19): longest shortest path in the comm
+    graph. Unlimited range is a complete graph, so D = 1. A disconnected
+    graph has no finite diameter; fall back to the fleet size, which is
+    the loosest bound that still terminates."""
+    robots = model.robots
+    n = len(robots)
+    if n <= 1 or model.comms.comm_range is None:
+        return 1
+    adj = {r.robot_id: [b.robot_id for b in model.comms.neighbors(r)]
+           for r in robots}
+    best = 1
+    for src in adj:
+        seen = {src: 0}
+        q = deque([src])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in seen:
+                    seen[v] = seen[u] + 1
+                    q.append(v)
+        if len(seen) < n:
+            return n
+        best = max(best, max(seen.values()))
+    return max(1, best)
+
+
+#########################
 
 class Allocator:
     name = "base"
 
     def allocate(self, model) -> None:  # pragma: no cover - interface
         raise NotImplementedError
-    
+
+
 class GreedyAllocator(Allocator):
-    """Each idle robot takes the cheapest pending task, in shuffled order."""
+    """Each idle robot takes the cheapest pending task, in shuffled
+    order. Cost convention: lower bid wins."""
 
     name = "greedy"
 
@@ -106,117 +155,85 @@ class GreedyAllocator(Allocator):
             pending = model.tasks.pending
             if not pending:
                 return
-            bids = [(bid_value(model, robot, t, model.w1, model.w2), t)
-                    for t in pending]
-            bids = [(bid, dumpCoord, t) for (bid, dumpCoord), t in bids
-                    if bid != float("inf")]
-            for bid, dumpCoord, t in sorted(bids, key=lambda bdt: bdt[0]):
+            bids = []
+            for t in pending:
+                v, q = bid_value(model, robot, t, model.w1, model.w2)
+                if v != INF and q is not None:
+                    bids.append((v, t))
+            for _, t in sorted(bids, key=lambda vt: vt[0]):
                 if robot.assign(t.task_id):
                     break
 
-def leg_cost(model, robot, task, startPos = None) -> tuple[float, ...]:
-    """Cost of robot i taking task j: tau_ij and E_ij."""
-    coord = task.cell
-    terrain = Terrain(int(model.grid.terrain.data[coord]))
-    h = HARDNESS[terrain]
-    startPosLeg = robot.cell.coordinate if startPos is None else startPos
 
-    dig = nearest_work_path(startPosLeg, [coord],
-                            model.grid.width, model.grid.height,
-                            model.blocked_cells())
-    if dig is None:
-        return float("inf"), float("inf"), None # type: ignore
-    p_star, d_task, path_task = dig
-    dump = model.dump_work_path(p_star)
-    if dump is None:
-        return float("inf"), float("inf"), None # type: ignore
-    dumpCoord, d_dump, path_dump = dump
+# ------------------------------------------------------------------ #
+# CBBA scoring
+# ------------------------------------------------------------------ #
+def pathScoreCBBA(model, robot, path, lam: float = LAMBDA,
+                  task_reward: float = TASK_REWARD) -> float:
+    """S_i^{p_i}, Choi et al. Eq. (11), instantiated for Eq. (1) of the
+    proposal.
 
-    climbEnergyUsageToTask = path_climb(path_task, model.grid.elevation.data)
-    climbEnergyUsageTaskToDump = path_climb(path_dump, model.grid.elevation.data)
+    The paper discounts by ARRIVAL TIME alone. We discount by the
+    accrued objective w1*tau + w2*E, so that the reward CBBA maximises
+    is a monotone transform of the J(x) the experiment reports. The old
+    version hardcoded its own task_reward / energy_weight and ignored
+    model.w1/w2 entirely, so CBBA and CBPAE were optimising different
+    objectives and the comparison between them meant nothing.
 
-    t = tau_ij(robot.spec, task.remaining, h, d_task, d_dump)
-    e = energy_ij(robot.spec, task.remaining, h, d_task, d_dump, climbEnergyUsageToTask, climbEnergyUsageTaskToDump)
-    return t, e, dumpCoord
-
-def bid_value(model, robot, task, w1: float = 1.0, w2: float = 1.0, startPos = None) -> tuple[float, ...]:
-    """Marginal cost of robot i taking task j: w1*tau_ij + w2*E_ij.
-    (Cost convention, used by the greedy baseline only.)"""
-    t, e, dumpCoord = leg_cost(model, robot, task, startPos)
-    if dumpCoord is None:
-        return INF, None # type: ignore
-    return w1 * t + w2 * e, dumpCoord
-    
-# The path score should be time-discounted, meaning later task in the path should have less weight than earlier task. 
-# The path score is the sum of discounted reward minus energy cost for each task in the path.
-def pathScoreCBBA(model, robot, path, lam=0.99, task_reward=10.0, energy_weight=0.1) -> float:
-    t_clock, score = 0.0, 0.0
-    # When the robot finish dumping, its start position for the next task will be the grid coordinate of the cell 
-    # it was at to dump the load. 
-    dumpCoord = None
-    for taskID in path:
-        task = model.tasks.get(taskID)
-        tau, e, dumpCoord = leg_cost(model, robot, task, dumpCoord)
-        if dumpCoord is None:
-            return NOBID
-        t_clock += tau
-        # Below is a decaying function
-        score += (lam ** t_clock) * task_reward - energy_weight * e
-    return score
-
-def _better_bid(bid_a, agent_a, bid_b, agent_b) -> bool:
-    """True if (bid_a by agent_a) beats (bid_b by agent_b).
- 
-    Reward maximisation (Choi et al.'s original convention): the HIGHER
-    bid wins. Exact ties are broken by the lower robot id — the paper
-    (Sec. III-B) requires a systematic tie-break, otherwise two robots
-    that compute identical bids can both keep believing they won and
-    consensus never converges.
+    Two properties matter and both survive the change:
+      - NON-NEGATIVE: every term is task_reward * lam**(cost) > 0, so
+        Sec. IV-A's assumption c_ij[b_i] >= 0 holds and inserting a task
+        at the end of the path always yields a strictly positive gain.
+        Marginal gains can no longer go negative.
+      - DMG (Eq. 7): inserting a task can only increase the accrued cost
+        at every later task in the path -- the Eq. (12) triangle-
+        inequality argument, with cost in place of time -- so each
+        existing term can only shrink. Gains therefore diminish.
     """
-    if agent_a is None:
-        return False
-    if agent_b is None:
-        return bid_a > NOBID
-    if bid_a > bid_b + EPS:
-        return True
-    if bid_b > bid_a + EPS:
-        return False
-    # The bid are equal if it gets to this line, so we choose a random winner
-    return agent_a < agent_b
+    clock = 0.0
+    score = 0.0
+    startPos = None
+    for task_id in path:
+        task = model.tasks.get(task_id)
+        tau, e, dumpCoord = leg_cost(model, robot, task, startPos)
+        if dumpCoord is None:
+            return NOBID          # infeasible path scores nothing
+        clock += model.w1 * tau + model.w2 * e
+        score += task_reward * (lam ** clock)
+        startPos = dumpCoord      # next leg starts where this one dumped
+    return score
 
 
 class CBBAAgent:
     """Consensus-Based Bundle Algorithm (Choi et al., 2009).
 
-    TODO: bundle construction via marginal-gain bidding using
-    `bid_value`, then the consensus/conflict-resolution table.
-    Validate against the MIT ACL reference implementation.
-
-    Consensus should exchange (y, z, s) via the comms layer:
-        robot.send(payload)                          # broadcast
-        model.comms.flush_and_deliver(model.tick)    # synchronous round
-        msgs = robot.receive_all()
+    State per Sec. IV-A: bundle b_i, path p_i, winning bids y_i,
+    winning agents z_i, timestamps s_i.
     """
 
     def __init__(self):
         self.path = []
         self.task_list = []
-        self.bundle = []     # b_i
+        self.bundle = []            # b_i
         self.winningAgentList = {}  # z_i
         self.winningBidList = {}    # y_i
         self.timeStamp: dict[int, int] = {}  # s_i
+        self._score_memo: dict[int, float] = {}   # Lemma 4 clamp
 
     def _bid(self, task_id) -> float:
         return self.winningBidList.get(task_id, NOBID)
-    
-    def _winner(self, task_id) -> int:
-        return self.winningAgentList.get(task_id, None) # type: ignore
-    
+
+    def _winner(self, task_id):
+        return self.winningAgentList.get(task_id, None)
+
     def _stamp(self, agent_id) -> int:
         return self.timeStamp.get(agent_id, -1)
-    
-    # Sending the task to all neighbouring robots (Phase 6 will enforce the communication range)
+
+    # -------------------------------------------------------------- #
+    # communication
+    # -------------------------------------------------------------- #
     def broadcast(self, robot, now: int) -> None:
+        """Broadcast (y, z, s) to neighbours."""
         self.timeStamp[robot.robot_id] = now
         robot.send({
             "sender": robot.robot_id,
@@ -225,25 +242,45 @@ class CBBAAgent:
             "s": dict(self.timeStamp),
         })
 
+    def mergeTimestamps(self, sender_id: int, other_s: dict, now: int) -> None:
+        """Eq. (5): s_ik = tau_r for a direct neighbour k, and
+        max over neighbours m of s_mk for everyone else.
+
+        This was the missing half of the consensus. Without it every
+        s_im stayed at its -1 default, `newer(m)` in the decision table
+        was True whenever the sender knew anything at all about m, and
+        roughly half of Table I collapsed into a single branch. It costs
+        nothing at D = 1 and is load-bearing at any finite comm_range.
+        """
+        self.timeStamp[sender_id] = now
+        for m, s in other_s.items():
+            if m == sender_id:
+                continue
+            if s > self.timeStamp.get(m, -1):
+                self.timeStamp[m] = s
+
+    # -------------------------------------------------------------- #
+    # Table I
+    # -------------------------------------------------------------- #
     def _CBBADecisionTable(self, i, k, j, y_k, z_k, s_k) -> str:
         """Table I: receiver i's action on task j after hearing from k.
- 
+
         Returns "update", "reset" or "leave" (the default).
         """
         zk = z_k.get(j)          # who the sender thinks won j
         zi = self._winner(j)     # who I think won j
         ykj = y_k.get(j, NOBID)  # the bid of agent k on task j
-        yij = self._bid(j)       # the bid of ourselves (agent i) on task j
- 
+        yij = self._bid(j)       # my own bid on task j
+
         def newer(m) -> bool:
             """s_km > s_im: the sender's information about m is fresher."""
             return s_k.get(m, -1) > self._stamp(m)
- 
+
         def better() -> bool:
-            """y_kj beats y_ij (lower cost, tie-break on robot id)."""
+            """y_kj beats y_ij (higher reward, tie-break on robot id)."""
             return _better_bid(ykj, zk, yij, zi)
- 
-        # ---- sender (k) thinks z_kj = k (it won the task itself) ---------- #
+
+        # ---- sender (k) thinks z_kj = k (it won the task itself) ----- #
         if zk == k:
             if zi == i:
                 return "update" if better() else "leave"
@@ -252,7 +289,7 @@ class CBBAAgent:
             if zi is None:
                 return "update"
             return "update" if (newer(zi) or better()) else "leave"   # zi = m
- 
+
         # ---- sender thinks z_kj = i (I won it) ----------------------- #
         if zk == i:
             if zi == i:
@@ -262,8 +299,8 @@ class CBBAAgent:
             if zi is None:
                 return "leave"
             return "reset" if newer(zi) else "leave"                  # zi = m
- 
-        # ---- sender thinks nobody won it ----------------------------- #
+
+        # ---- sender thinks nobody won it ---------------------------- #
         if zk is None:
             if zi == i:
                 return "leave"
@@ -272,8 +309,8 @@ class CBBAAgent:
             if zi is None:
                 return "leave"
             return "update" if newer(zi) else "leave"                 # zi = m
- 
-        # ---- sender thinks z_kj = m, some third agent ---------------- #
+
+        # ---- sender thinks z_kj = m, some third agent --------------- #
         m = zk
         if zi == i:
             return "update" if (newer(m) and better()) else "leave"
@@ -283,8 +320,8 @@ class CBBAAgent:
             return "update" if newer(m) else "leave"
         if zi == m:
             return "update" if newer(m) else "leave"
- 
-        # ---- zi = n, a fourth agent ---------------------------------- #
+
+        # ---- zi = n, a fourth agent --------------------------------- #
         n = zi
         if newer(m) and newer(n):
             return "update"
@@ -294,304 +331,322 @@ class CBBAAgent:
             return "reset"
         return "leave"
 
-    # Equation 6 in the paper: if a task is outbid, we have to remove all the tasks that were added after it because
-    # the score for that bundle will turn incorrect
-    def _releaseOutbid(self, i) -> bool:
+    # -------------------------------------------------------------- #
+    # Eq. (6)
+    # -------------------------------------------------------------- #
+    def _releaseOutbid(self, i, locked=None) -> bool:
+        """Eq. (6): if a task is outbid, everything added to the bundle
+        after it must be released too, because removing b_{i,n_bar}
+        changes the marginal score of every ensuing task.
 
+        `locked` is the task currently under execution; it can never be
+        released (the robot is physically standing in the hole), so the
+        scan starts after it.
+        """
         n_bar = None
         for n, task_id in enumerate(self.bundle):
+            if task_id == locked:
+                continue
             if self._winner(task_id) != i:
                 n_bar = n
                 break
         if n_bar is None:
             return False
- 
-        for task_id in self.bundle[n_bar + 1:]:
 
-            # Resetting the bid and winning agent for that task
+        # b_{i,n_bar} keeps its (losing) y/z; everything strictly after
+        # it that I still hold is reset -- Eq. (6) exactly.
+        for task_id in self.bundle[n_bar + 1:]:
             if self._winner(task_id) == i:
                 self.winningBidList[task_id] = NOBID
                 self.winningAgentList[task_id] = None
-        
-        # Removing from the path dictionary
+
         for task_id in self.bundle[n_bar:]:
             if task_id in self.path:
                 self.path.remove(task_id)
 
-        # Removing from the bundle
         del self.bundle[n_bar:]
         return True
 
-    # winningBidList is a local dictionary that each robot has. This will be updated in the conflict resolution phase
-    def createBundle(self, model, robot, winningAgentList, winningBidList, bundle):
-        # NOTE: these are copies now, not aliases. See notes at the bottom of the file.
-        # Also, I don't understand why do we have to do this instead of directly operating on the class members??
-        currentWinningBidList = dict(winningBidList)
-        currentWinningAgentList = dict(winningAgentList)
-        self.bundle = list(bundle)
-        currentPath = list(self.path)
-    
+    # -------------------------------------------------------------- #
+    # Phase 1: bundle construction (Algorithm 3)
+    # -------------------------------------------------------------- #
+    def _clamped_gain(self, task_id: int, raw: float) -> float:
+        """Lemma 4: c_ij(t) = min(c_ij_raw(t), c_ij(t-1)).
+
+        The paper proves CBBA converges to a conflict-free assignment
+        within N_min*D iterations for ANY scoring scheme, DMG or not,
+        provided the scores are made monotonically non-increasing over
+        iterations this way. Reset once per auction episode, since the
+        proof is over the iterations of one episode.
+        """
+        prev = self._score_memo.get(task_id, INF)
+        c = min(raw, prev)
+        self._score_memo[task_id] = c
+        return c
+
+    def createBundle(self, model, robot):
+        """Algorithm 3. Operates on self.bundle / self.path directly --
+        the old signature took y/z/bundle as arguments and then
+        reassigned the members anyway, which is what the note in the
+        original file was complaining about."""
         tag = f"[R{robot.robot_id}]"
+        locked = robot.task_id
         known_ids = [t.task_id for t in self.task_list]
-    
+
         _dbg(1, "=" * 78)
-        _dbg(1, f"{tag} createBundle ENTRY")
-        _dbg(1, f"{tag}   capacity        : {robot.bundle_limit}")
-        _dbg(1, f"{tag}   bundle in       : {self.bundle}")
-        _dbg(1, f"{tag}   path   in       : {currentPath}")
-        _dbg(1, f"{tag}   y (winning bids): {_fmt_map(currentWinningBidList)}")
-        _dbg(1, f"{tag}   z (winners)     : {_fmt_map(currentWinningAgentList)}")
-        _dbg(1, f"{tag}   task_list ids   : {known_ids}")
-    
-        _check_consistency(tag, self.bundle, currentPath, "on entry")
-    
-        # Are the bid/winner tables actually initialised for every task?
-        missing_y = [tid for tid in known_ids if tid not in currentWinningBidList]
-        if missing_y:
-            _dbg(1, f"{tag}   note: no y entry for {missing_y} -> treated as -inf (nobid)")
-    
+        _dbg(1, f"{tag} createBundle ENTRY  L_t={robot.bundle_limit}")
+        _dbg(1, f"{tag}   bundle in : {self.bundle}")
+        _dbg(1, f"{tag}   path   in : {self.path}")
+        _dbg(1, f"{tag}   y         : {_fmt_map(self.winningBidList)}")
+        _dbg(1, f"{tag}   z         : {_fmt_map(self.winningAgentList)}")
+        _dbg(1, f"{tag}   task_list : {known_ids}")
+        _check_consistency(tag, self.bundle, self.path, "on entry")
+
         iteration = 0
         while len(self.bundle) < robot.bundle_limit:
-            allTaskIDs = set(self.bundle)
-
-            # Create a list of tasks that are not added to the bundle of the current robot yet
-            taskNotInBundles = [t for t in self.task_list if t.task_id not in allTaskIDs]
-    
-            # The score of the currently constructed path.
-            currentPathScore = pathScoreCBBA(model, robot, currentPath)
-    
-            _dbg(1, "-" * 78)
-            _dbg(1, f"{tag} iter {iteration} | bundle={self.bundle} path={currentPath} "
-                    f"| S(path)={_fmt_num(currentPathScore)}")
-            _dbg(1, f"{tag} candidates: {[t.task_id for t in taskNotInBundles]}")
-    
-            if not taskNotInBundles:
+            inBundle = set(self.bundle)
+            candidates = [t for t in self.task_list
+                          if t.task_id not in inBundle]
+            if not candidates:
                 _dbg(1, f"{tag} STOP: no tasks left outside the bundle")
                 break
-    
-            # Preparing the variables to deal with the maximising problem
-            currentImprovement = NOBID
+
+            currentPathScore = pathScoreCBBA(model, robot, self.path)
+
+            _dbg(1, "-" * 78)
+            _dbg(1, f"{tag} iter {iteration} | bundle={self.bundle} "
+                    f"path={self.path} | S(path)={_fmt_num(currentPathScore)}")
+
+            bestGain = 0.0     # h_ij also requires c_ij > 0 (Sec. IV-A)
             Ji = None
             JiPathLocation = None
-    
-            _dbg(1, f"{tag}   {'task':>6} {'pos':>4} {'S(new)':>8} {'c_ij':>8} {'y_ij':>8}  verdict")
-    
-            for taskNotInBundle in taskNotInBundles:
+
+            for cand in candidates:
                 bestBidTask = NOBID
                 bestTaskLocation = None
-
-                # Try inserting the task at every possible positions in the current path
-                for trialPosition in range(len(currentPath) + 1):
-                    trialPath = (currentPath[:trialPosition]
-                                + [taskNotInBundle.task_id]
-                                + currentPath[trialPosition:])
-                    # Compute the path score for the new path with the inserted task
+                for trialPosition in range(len(self.path) + 1):
+                    trialPath = (self.path[:trialPosition]
+                                 + [cand.task_id]
+                                 + self.path[trialPosition:])
                     trialBid = pathScoreCBBA(model, robot, trialPath)
-                    _dbg(2, f"{tag}      try {taskNotInBundle.task_id} @ pos {trialPosition}: "
-                            f"path={trialPath} S={_fmt_num(trialBid)}")
-                    
-                    # Find the best location to insert that task
-                    if trialBid > bestBidTask:
+                    if bestTaskLocation is None or trialBid > bestBidTask:
                         bestBidTask = trialBid
                         bestTaskLocation = trialPosition
-    
-                # Check if the task's bid can win the bid for that same task coming from the sender
-                improvement = bestBidTask - currentPathScore
-                y_ij = currentWinningBidList.get(taskNotInBundle.task_id, NOBID)
-    
-                # --- diagnostics on the bid itself ---
-                notes = []
-                if bestTaskLocation is None:
-                    notes.append("NO VALID POSITION (all insertions infeasible)")
-                if improvement < 0:
-                    notes.append("negative gain (energy penalty > discounted reward)")
-                if improvement != improvement:  # NaN
-                    notes.append("NaN marginal gain")
-    
-                beats_y = improvement > y_ij    # line 8: must beat the incumbent
-                if not beats_y:
-                    verdict = "loses to incumbent bid"
-                elif improvement > currentImprovement:
-                    verdict = "NEW BEST"
-                else:
-                    verdict = "beats y, not best"
 
-                _dbg(1, f"{tag}   {taskNotInBundle.task_id:>6} {str(bestTaskLocation):>4} "
-                        f"{_fmt_num(bestBidTask)} {_fmt_num(improvement)} {_fmt_num(y_ij)}  {verdict}"
-                        + ("  <<< " + "; ".join(notes) if notes else ""))
-    
-                # If the task is winnable and offers the best improvement in all tasks tried, we update Ji to hold that task, which will be added 
-                # to the bundle
-                if beats_y and improvement > currentImprovement:
-                    currentImprovement = improvement
-                    Ji = taskNotInBundle.task_id
+                if bestTaskLocation is None:
+                    continue
+                gain = self._clamped_gain(cand.task_id,
+                                          bestBidTask - currentPathScore)
+                y_ij = self._bid(cand.task_id)
+
+                # Eq. (4): h_ij = I(c_ij > y_ij), and c_ij >= 0
+                if gain <= EPS or gain <= y_ij + EPS:
+                    continue
+                if gain > bestGain:
+                    bestGain = gain
+                    Ji = cand.task_id
                     JiPathLocation = bestTaskLocation
-    
+
             if Ji is None:
                 _dbg(1, f"{tag} STOP: no task beat its incumbent bid "
-                        f"(bundle size {len(self.bundle)}/{robot.bundle_limit})")
+                        f"({len(self.bundle)}/{robot.bundle_limit})")
                 break
-    
-            # Adding the task to the bundle, path, bid list and winning agent list
+
             self.bundle.append(Ji)
-            currentPath.insert(JiPathLocation, Ji) # type: ignore
-            currentWinningBidList[Ji] = currentImprovement
-            prev_winner = currentWinningAgentList.get(Ji)
-            currentWinningAgentList[Ji] = robot.robot_id
-    
+            self.path.insert(JiPathLocation, Ji)
+            prev_winner = self.winningAgentList.get(Ji)
+            self.winningBidList[Ji] = bestGain
+            self.winningAgentList[Ji] = robot.robot_id
+
             _dbg(1, f"{tag} ADD task {Ji} at path pos {JiPathLocation} "
-                    f"| c={_fmt_num(currentImprovement)} | took it from z={prev_winner}")
-            _dbg(1, f"{tag}     bundle -> {self.bundle}")
-            _dbg(1, f"{tag}     path   -> {currentPath}")
-            _check_consistency(tag, self.bundle, currentPath, f"after adding {Ji}")
-    
+                    f"| c={_fmt_num(bestGain)} | took it from z={prev_winner}")
+            _check_consistency(tag, self.bundle, self.path, f"after add {Ji}")
+
             iteration += 1
             if iteration > len(self.task_list) + robot.bundle_limit + 1:
                 _dbg(1, f"{tag} !! ABORT: while-loop is not terminating")
                 break
-    
-        if len(self.bundle) >= robot.bundle_limit:
-            _dbg(1, f"{tag} STOP: capacity reached ({len(self.bundle)}/{robot.bundle_limit})")
 
-        # Update the internal class variable to reflect the new changes
-        self.winningAgentList = currentWinningAgentList
-        self.winningBidList = currentWinningBidList
-        self.path = currentPath
-    
-        _dbg(1, f"{tag} createBundle EXIT")
-        _dbg(1, f"{tag}   bundle out      : {self.bundle}")
-        _dbg(1, f"{tag}   path   out      : {self.path}")
-        _dbg(1, f"{tag}   y (winning bids): {_fmt_map(currentWinningBidList)}")
-        _dbg(1, f"{tag}   z (winners)     : {_fmt_map(currentWinningAgentList)}")
-        # bundle order == order added; path order == execution order. They should differ
-        # in general, but must contain the same ids.
+        if locked is not None:
+            self.winningBidList[locked] = LOCKED_BID
+            self.winningAgentList[locked] = robot.robot_id
+
+        _dbg(1, f"{tag} createBundle EXIT bundle={self.bundle} "
+                f"path={self.path}")
         _check_consistency(tag, self.bundle, self.path, "on exit")
-        _dbg(1, "=" * 78)
-    
-        return currentWinningAgentList, currentWinningBidList, self.bundle
+        return self.winningAgentList, self.winningBidList, self.bundle
 
-    # Phase 2: Conflict Resolution
+    # -------------------------------------------------------------- #
+    # Phase 2: conflict resolution (Algorithm 2 + Table I)
+    # -------------------------------------------------------------- #
     def resolveConflicts(self, robot, receivedMessages) -> bool:
-        # Deciding the outcome for received tasks using table 1
-        # Return true if the fleet hasn't converged and another iteration is needed
+        """Returns True if anything changed, i.e. another round is
+        needed before the fleet has converged."""
         i = robot.robot_id
+        now = robot.model.tick
         changed = False
 
         for msg in receivedMessages:
             payload = msg.payload
-            # Getting the ID of the sender who send out that message
             k = payload.get("sender")
             if k is None or k == i:
                 continue
 
-            # This is the list from the other senders
             otherWinningBidList = payload.get("y", {})
             otherWinningAgentList = payload.get("z", {})
             otherTimestamps = payload.get("s", {})
 
-            # Find conflicting tasks between both agents
-            taskIDInBothParties = set(self.winningBidList) | set(otherWinningBidList) | set(self.winningAgentList) | set(otherWinningAgentList)
-            # print("Tasl IDs in both parties: {}".format(taskIDInBothParties))
-            for taskID in taskIDInBothParties:
-                # Resolving the allocation conflict using the Table 1 in the paper
-                action = self._CBBADecisionTable(i, k, taskID, otherWinningBidList, otherWinningAgentList, otherTimestamps)
+            taskIDs = (set(self.winningBidList) | set(otherWinningBidList)
+                       | set(self.winningAgentList)
+                       | set(otherWinningAgentList))
+            for taskID in taskIDs:
+                if self.winningBidList.get(taskID) == LOCKED_BID \
+                        and self.winningAgentList.get(taskID) == i:
+                    continue        # my task is under execution: untouchable
+
+                action = self._CBBADecisionTable(
+                    i, k, taskID, otherWinningBidList,
+                    otherWinningAgentList, otherTimestamps)
 
                 if action == "update":
                     new_y = otherWinningBidList.get(taskID, NOBID)
                     new_z = otherWinningAgentList.get(taskID)
-
-                    # if there are new information
-                    if new_z != self._winner(taskID) or abs(new_y - self._bid(taskID)) > EPS:
-                        # Updating the list based on the conflict resolution rules
+                    if new_z != self._winner(taskID) \
+                            or abs(new_y - self._bid(taskID)) > EPS:
                         self.winningBidList[taskID] = new_y
                         self.winningAgentList[taskID] = new_z
                         changed = True
-                
-                # Resetting the winning bid and agent list to the initial value of -inf and None
+
                 elif action == "reset":
-                    if self._winner(taskID) is not None or self._bid(taskID) != NOBID:
+                    if self._winner(taskID) is not None \
+                            or self._bid(taskID) != NOBID:
                         self.winningBidList[taskID] = NOBID
                         self.winningAgentList[taskID] = None
                         changed = True
-                # The other case is "leave", in which we will do nothing
-        
-        # Removing and resetting all the task after the outbidded tasks after the for loop above.
-        if self._releaseOutbid(i):
+                # "leave": do nothing
+
+            # Eq. (5). Done after the table so the decisions above see
+            # the sender's s_k against my PRE-merge s_i.
+            self.mergeTimestamps(k, otherTimestamps, now)
+
+        if self._releaseOutbid(i, locked=robot.task_id):
             changed = True
-        
-        print(f"Robot {robot.robot_id} has finished its conflict resolution. Current Bundle: {self.bundle}, Current Path: {self.path}, Current Winning Bid List: {self.winningBidList}, Current Winning Agent List: {self.winningAgentList}")
 
+        _dbg(2, f"[R{i}] resolve -> bundle={self.bundle} path={self.path}")
         return changed
-    
 
-# This is the allocator that serves the simulation purpose, therefore it will be centralised.
-# All of the decision-making on CBBA is decentralised
+    # -------------------------------------------------------------- #
+    def prune(self, model, robot) -> None:
+        """Drop finished tasks, and tasks another robot is executing,
+        from the bundle and path. With persistent bundles this is what
+        keeps them from accumulating stale ids forever."""
+        keep = []
+        for task_id in self.bundle:
+            task = model.tasks.get(task_id)
+            if task.done:
+                continue
+            if task.assigned_to is not None and task.assigned_to != robot.robot_id:
+                continue
+            keep.append(task_id)
+        dropped = set(self.bundle) - set(keep)
+        if dropped:
+            self.bundle = keep
+            self.path = [t for t in self.path if t not in dropped]
+            for task_id in dropped:
+                self.winningBidList.pop(task_id, None)
+                self.winningAgentList.pop(task_id, None)
+
+
 class CBBAAllocator(Allocator):
+    """Centralised driver for a decentralised algorithm: the simulator
+    steps every robot's local CBBA instance in lockstep. All the
+    decision-making stays inside CBBAAgent."""
+
     name = "cbba"
-    MAX_ROUNDS = 20
-    
+    ROUND_CEILING = 200      # hard stop; the real bound is N_min * D
+
     def __init__(self) -> None:
         self.last_round = 0
-    
-    def allocate(self, model) -> None:
-        idle = [r for r in model.robots if r.task_id is None]
-        pending = model.tasks.pending
-        if not idle or not pending:
-            return
-        
-        _dbg(1, f"\n[AUCTION @ tick {model.tick}] "
-                f"{len(idle)} idle robot(s) {[r.robot_id for r in idle]} | "
-                f"{len(pending)} open task(s) {[t.task_id for t in pending]}")
-        
-        # Flush the robots' inbox
-        for r in model.robots:
-            r.receive_all()
-        
-        # Clean the robot's CBBA variables before a new bidding round begin
-        for r in idle:
-            c = r.CBBA
-            c.task_list = pending
-            c.bundle, c.path = [], []
-            c.winningAgentList, c.winningBidList = {}, {}
-            c.timeStamp = {}
+        self.converged = False
+        self._signature = None
 
+    def _trigger(self, model, robots, open_tasks):
+        """Re-auction only on a change in the situation: a robot freed
+        up, a task finished, or the terrain moved (Algorithm 1 lines
+        3-7). Holding a converged assignment between changes is the
+        point of a time-extended allocation -- re-running the auction
+        every tick would both burn A* calls and churn bundles that
+        nothing has invalidated."""
+        sig = (frozenset(r.robot_id for r in robots if r.task_id is None),
+               frozenset(t.task_id for t in open_tasks),
+               bool(model.changed_cells))
+        if sig == self._signature and self.converged:
+            return False
+        self._signature = sig
+        return True
+
+    def allocate(self, model) -> None:
+        robots = model.robots
+        open_tasks = [t for t in model.tasks.unfinished]
+        if not robots or not open_tasks:
+            return
+        if not self._trigger(model, robots, open_tasks):
+            return
+
+        for r in robots:
+            r.CBBA.prune(model, r)
+            # A robot may bid on any unfinished task that nobody else is
+            # executing; its own current task stays visible so it keeps
+            # winning it.
+            r.CBBA.task_list = [
+                t for t in open_tasks
+                if t.assigned_to is None or t.assigned_to == r.robot_id]
+            r.CBBA._score_memo = {}
+            r.receive_all()          # drop anything stale in the inbox
+
+        # Theorem 1: convergence within N_min * D iterations.
+        L_t = max(r.bundle_limit for r in robots)
+        n_min = min(len(open_tasks), len(robots) * L_t)
+        max_rounds = min(self.ROUND_CEILING,
+                         max(1, n_min * network_diameter(model)))
+
+        _dbg(1, f"\n[AUCTION @ tick {model.tick}] {len(robots)} robots, "
+                f"{len(open_tasks)} open tasks, max_rounds={max_rounds}")
+
+        self.converged = False
         self.last_round = 0
-        converged = False
-        for rnd in range(1, self.MAX_ROUNDS + 1):
-            for robot in idle:
-                robot.CBBA.createBundle(model, robot, robot.CBBA.winningAgentList, robot.CBBA.winningBidList, robot.CBBA.bundle)
+        for rnd in range(1, max_rounds + 1):
+            for robot in robots:
+                robot.CBBA.createBundle(model, robot)
                 robot.CBBA.broadcast(robot, rnd)
             model.comms.flush_and_deliver(model.tick)
-            changed = [r.CBBA.resolveConflicts(r, r.receive_all()) for r in idle]
+            changed = [r.CBBA.resolveConflicts(r, r.receive_all())
+                       for r in robots]
             self.last_round = rnd
-
-            _dbg(1, f"[AUCTION]   round {rnd}: changed="
-                    f"{dict(zip([r.robot_id for r in idle], changed))}")
-            
             if not any(changed):
-                converged = True
+                self.converged = True
                 break
 
-        _dbg(1, f"[AUCTION] {'converged' if converged else 'HIT MAX_ROUNDS'} "
+        _dbg(1, f"[AUCTION] {'converged' if self.converged else 'HIT BOUND'} "
                 f"after {self.last_round} round(s)")
 
-        # Assign the tasks to the robot. It will skip already completed tasks
-        for robot in idle:
-            started = None
-            for task_id in robot.CBBA.path:
+        # Execute: an idle robot starts the first task in its path that
+        # is still available. The rest of the bundle is kept, not thrown
+        # away -- that is the whole point of a bundle algorithm.
+        for robot in robots:
+            if robot.task_id is not None:
+                continue
+            for task_id in list(robot.CBBA.path):
+                if robot.CBBA._winner(task_id) != robot.robot_id:
+                    continue
                 if robot.assign(task_id):
-                    started = task_id
+                    _dbg(1, f"[AUCTION]   R{robot.robot_id} starts {task_id}, "
+                            f"bundle={robot.CBBA.bundle}")
                     break
-                _dbg(1, f"[AUCTION]   robot {robot.robot_id}: task "
-                        f"{task_id} unreachable/taken, trying next in path")
-            plan = [t for t in robot.CBBA.path if t != started]
-            if started is None:
-                _dbg(1, f"[AUCTION]   robot {robot.robot_id}: NOTHING "
-                        f"assigned (path={robot.CBBA.path})")
-            else:
-                _dbg(1, f"[AUCTION]   robot {robot.robot_id}: starts task "
-                        f"{started}, plan for later: {plan or 'none'}")
+                robot.CBBA.path.remove(task_id)
+                if task_id in robot.CBBA.bundle:
+                    robot.CBBA.bundle.remove(task_id)
 
 
-ALLOCATORS = {a.name: a for a in (GreedyAllocator, CBBAAllocator, CBPAEAllocator,
-                                  MOACBBAAllocator)}
+ALLOCATORS = {a.name: a for a in (GreedyAllocator, CBBAAllocator,
+                                  CBPAEAllocator, MOACBBAAllocator)}

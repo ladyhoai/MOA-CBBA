@@ -78,16 +78,30 @@ def astar(
     return None
 
 def path_climb(path, elevation) -> float:
-    """Total elevation travelled along the path which is passed as a parameter"""
+    """Total elevation GAINED along the path.
+
+    Only ascents are charged, because that is exactly what
+    robot._spend_move does (`if gain > 0.0`). Summing the signed deltas
+    -- the old behaviour -- returned the NET change, so any route with a
+    descent anywhere in it was bid below its true execution cost, and a
+    route that ended lower than it started was billed a climb credit
+    that the simulation never gives back.
+
+    For the return leg of a dump trip, call this with the reversed path:
+    the descents on the way out are ascents on the way home.
+
+    NOTE (open): a diagonal step covers sqrt(2) ground for the same
+    elevation delta, so strictly it should cost less per metre climbed
+    than an orthogonal one. The simulation makes the same simplification,
+    so the invariant holds; both would have to change together.
+    """
     if not path or len(path) < 2:
         return 0.0
     total = 0.0
-    # TODO: I think diagonal travel will have a different way to calculate the elevation gain. TODO
-
     for a, b in zip(path, path[1:]):
         d = float(elevation[b]) - float(elevation[a])
-        total += d
-    
+        if d > 0.0:
+            total += d
     return total
 
 def astar_distance(

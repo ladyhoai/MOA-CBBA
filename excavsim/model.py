@@ -66,9 +66,9 @@ class ExcavationModel(Model):
         height: int = 32,
         n_robots: int = 4,
         n_tasks: int = 8,
-        allocator: str = "cbpae",
-        w1: float = 1.5,
-        w2: float = 0.5,
+        allocator: str = "cbba",
+        w1: float = 1,
+        w2: float = 1,
 
         # --- Phase 2 heterogeneity (Table 1, items 2.1-2.4) --------- #
         fleet_mode: str = "capacity",   # "none" | "capacity" | "full"
@@ -79,8 +79,12 @@ class ExcavationModel(Model):
         comm_latency: int = 0,
         comm_bandwidth: int | None = None,
 
-        hazard_rate: float = 0.05,          # 4.2 zones/tick (0 = off)
-        obstacle_rate: float = 0.3,        # 4.3 obstacles/tick (0 = off)
+        # Phase 4 dynamics default to OFF. They used to default ON
+        # (0.05 / 0.3), which meant every run that did not explicitly
+        # zero them -- including every Phase 1/2 baseline -- was measured
+        # against a moving target.
+        hazard_rate: float = 0.0,          # 4.2 zones/tick (0 = off)
+        obstacle_rate: float = 0.0,        # 4.3 obstacles/tick (0 = off)
         weather_enabled: bool = False,     # 4.4 weather on/off
         weather_change_rate: float = 0.0,  # 4.4 transitions/tick
         hazard_duration: int = 5, hazard_size: int = 2,
@@ -97,7 +101,7 @@ class ExcavationModel(Model):
         task_volume: tuple[float, float] = (1.0, 4.0),
 
         # --- task decomposition (multi-robot cooperation per cell) --- #
-        max_sharers: int = 1,       # 1 = off, reproduces the old behaviour
+        max_sharers: int = 4,       # 1 = off, reproduces the old behaviour
         min_chunk: float = MIN_CHUNK,
         seed: int | None = None,
     ):
@@ -105,7 +109,17 @@ class ExcavationModel(Model):
         self.w1, self.w2 = w1, w2
         self.t_unload = T_UNLOAD
         self.tick = 0
+        # Largest CBBA bundle any robot has held this run. Cheap, and
+        # it is the one-number check that L_t > 1 is actually being used
+        # -- i.e. that this is CBBA and not CBAA in disguise.
+        self._max_bundle_seen = 0
+        self._static_blocked_cache: set[Coord] | None = None
+        # (robot, task, start) -> (tau, E, q*) for ONE auction round.
+        # Robots do not move during allocate(), so nothing that
+        # feeds a leg cost can change inside a round.
+        self._leg_cache: dict = {}
         self.changed_cells: set[Coord] = set()  # Algorithm 1, line 3 hook
+        print("Allocator used: ", allocator)
 
         # --- grid and property layers ---------------------------------- #
         self.grid = OrthogonalMooreGrid((width, height), torus=False,
@@ -126,6 +140,17 @@ class ExcavationModel(Model):
         self.dump_blocks: list[tuple[Coord, ...]] = []
         while len(self.dump_blocks) < 2:
             self._place_dump_block()
+
+        # --- Phase 4 dynamics (built early: blocked_cells() and
+        # traction_scale() are consulted from the first bid onwards) --- #
+        self.dynamics = DynamicsManager(
+            self, hazard_rate=hazard_rate, obstacle_rate=obstacle_rate,
+            weather_enabled=weather_enabled,
+            weather_change_rate=weather_change_rate,
+            hazard_duration=hazard_duration, hazard_size=hazard_size,
+            obstacle_duration=obstacle_duration,
+            obstacle_move_probability=obstacle_move_prob,
+            max_obstacles=max_obstacles)
 
         # --- tasks ------------------------------------------------------ #
         self.tasks = TaskRegistry()
@@ -177,6 +202,20 @@ class ExcavationModel(Model):
                 "mean_idle_ratio": lambda m: (
                     sum(r.idle_ticks for r in m.robots)
                     / max(1, m.tick * len(m.robots))),
+                # Das et al. report average distance per ACTIVE robot
+                # (a robot with at least one task allocated) alongside
+                # execution time; without it their Fig. 4 has no analogue.
+                "mean_distance_active": lambda m: (
+                    sum(r.distance_travelled for r in m.robots
+                        if r.tasks_completed or r.task_id is not None)
+                    / max(1, sum(1 for r in m.robots
+                                 if r.tasks_completed or r.task_id is not None))),
+                "total_distance": lambda m: sum(r.distance_travelled
+                                                for r in m.robots),
+                "energy_travel": lambda m: sum(r.energy_travel for r in m.robots),
+                "energy_climb": lambda m: sum(r.energy_climb for r in m.robots),
+                "energy_dig": lambda m: sum(r.energy_dig for r in m.robots),
+                "tasks_dropped": lambda m: sum(r.tasks_dropped for r in m.robots),
             },
             agenttype_reporters={
                 ExcavatorRobot: {
@@ -185,6 +224,12 @@ class ExcavationModel(Model):
                     "energy_used": "energy_used",
                     "idle_ticks": "idle_ticks",
                     "tasks_completed": "tasks_completed",
+                    "distance_travelled": "distance_travelled",
+                    "energy_travel": "energy_travel",
+                    "energy_climb": "energy_climb",
+                    "energy_dig": "energy_dig",
+                    "metres_climbed": "metres_climbed",
+                    "wait_ticks": "wait_ticks",
                     # Phase 2: without these you cannot tell whether the
                     # large machines are hoarding tasks or sitting idle.
                     # Callables, not attribute names, so this works
@@ -195,14 +240,6 @@ class ExcavationModel(Model):
             },
         )
 
-        self.dynamics = DynamicsManager(
-            self, hazard_rate=hazard_rate, obstacle_rate=obstacle_rate,
-            weather_enabled=weather_enabled,
-            weather_change_rate=weather_change_rate,
-            hazard_duration=hazard_duration, hazard_size=hazard_size,
-            obstacle_duration=obstacle_duration,
-            obstacle_move_probability=obstacle_move_prob,
-            max_obstacles=max_obstacles)
         self.datacollector.collect(self)
 
     # -------------------------------------------------------------------- #
@@ -211,25 +248,30 @@ class ExcavationModel(Model):
         self.dynamics.step(self.tick)
         self.comms.flush_and_deliver(self.tick)    # in-flight messages land
 
-        self.allocator.allocate(self)              # bidding + consensus (Greedy allocation)
+        self._leg_cache = {}                       # fresh per tick
+        self.allocator.allocate(self)              # bidding + consensus
         self.agents.shuffle_do("step")             # execute (random order)
+        self._max_bundle_seen = max(
+            [self._max_bundle_seen] + [len(r.CBBA.bundle) for r in self.robots])
         self.changed_cells.clear()
         self.datacollector.collect(self)
 
-        for r in self.robots:
-            if r.robot_id == 0 and r.task_id is None and len(self.tasks.pending) > 0:
-                j = r.CBPAE.bidTask
-                print(f"R0 idle w/ work: bid={j} "
-                    f"winner={r.CBPAE._winner(j) if j is not None else '-'} "
-                    f"reachable={len(r.CBPAE.biddable_tasks(self, r))} "
-                    f"pending={len(self.tasks.pending)}")
-
         # This is the stopping condition of the whole simulation
-        if len(self.tasks.isAllTaskDone) == len(self.tasks._tasks):
+        if self.tasks.all_done:
             self.running = False  # lets mesa.batch_run stop early
 
     def run(self, max_ticks: int = 5000) -> None:
-        while self.tasks.unfinished and self.tick < max_ticks:
+        """Run to completion.
+
+        The loop condition used to be `self.tasks.unfinished`, i.e.
+        remaining volume, while step() stops on all_done, i.e. volume
+        removed AND hauled AND stamped. So the run ended the moment the
+        last cell was empty, leaving robots mid-haul and the final tasks
+        with completed_tick = None -- which the makespan property then
+        skipped. Every reported makespan was short by roughly one dump
+        trip, and by more for the allocators that finished with several
+        robots still loaded."""
+        while not self.tasks.all_done and self.tick < max_ticks:
             self.step()
 
     # -------------------------------------------------------------------- #
@@ -276,10 +318,23 @@ class ExcavationModel(Model):
         return best
     
     def _static_blocked(self) -> set[Coord]:
-        # Permanently impassable cells: bedrock and dumpblocks
-        t = self.grid.terrain.data
-        xs, ys = np.where((t == int(Terrain.BEDROCK)) | (t == int(Terrain.DUMP_SITE)))
-        return set(zip(xs.tolist(), ys.tolist()))
+        """Permanently impassable cells: bedrock and dump blocks.
+
+        Cached. Digging removes VOLUME, never terrain TYPE, so this set
+        is fixed after setup -- but it was being rebuilt with a numpy
+        `where` scan on every blocked_cells() call, which is several
+        times per A* and thousands of times per auction round. Call
+        invalidate_static_blocked() if terrain types ever become
+        mutable (e.g. if bedrock is added at runtime)."""
+        if self._static_blocked_cache is None:
+            t = self.grid.terrain.data
+            xs, ys = np.where((t == int(Terrain.BEDROCK))
+                              | (t == int(Terrain.DUMP_SITE)))
+            self._static_blocked_cache = set(zip(xs.tolist(), ys.tolist()))
+        return self._static_blocked_cache
+
+    def invalidate_static_blocked(self) -> None:
+        self._static_blocked_cache = None
 
     def blocked_cells(self) -> set[Coord]:
         """Impassable cells: bedrock and dump blocks. Phase 4 adds
@@ -306,6 +361,7 @@ class ExcavationModel(Model):
             for c in block:
                 self.grid.terrain.data[c] = int(Terrain.DUMP_SITE)
             self.dump_blocks.append(block)
+            self._static_blocked_cache = None
             return
         raise RuntimeError("could not place dump block")
 
