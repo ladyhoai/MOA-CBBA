@@ -24,6 +24,10 @@ diverged from the paper and are fixed:
      the CBAA behaviour back as an ablation.
   4. MAX_ROUNDS was an arbitrary 20; Theorem 1 bounds convergence at
      N_min * D.
+  5. The s vector was written in two different clocks -- broadcast
+     stamped the round index, mergeTimestamps stamped model.tick -- so
+     newer(m) compared incomparable numbers. One monotone counter now
+     serves both, incremented once per auction round for the whole run.
 """
 
 from __future__ import annotations
@@ -370,6 +374,37 @@ class CBBAAgent:
     # -------------------------------------------------------------- #
     # Phase 1: bundle construction (Algorithm 3)
     # -------------------------------------------------------------- #
+    def _releaseStaleLocks(self, robot) -> None:
+        """Give back the unbeatable bid once the lock is over.
+
+        createBundle advertises y = LOCKED_BID (1e9) for the task under
+        execution, and NOTHING ever took it back. On the normal path that
+        is invisible: the task finishes, prune drops it as done and pops
+        y/z with it. But a task that is RELEASED rather than finished --
+        abandon_task, dropIfUnreachable, or robot.py's
+        UNREACHABLE_PATIENCE -- is not done and is not assigned to
+        anyone, so prune keeps it and the 1e9 survives.
+
+        Every robot then fails `c_ij > y_ij` against 1e9 forever, so no
+        robot can ever bid on that chunk again -- including the owner,
+        which simply re-assigns it to itself off its own path next round.
+        With the patience release in place that is a ~20-tick livelock on
+        a chunk the owner has already proved it cannot reach.
+
+        Resetting y/z here is enough: the following _releaseOutbid sees
+        that the robot is no longer the winner and truncates the bundle
+        from that point, which is Eq. (6) doing exactly its job.
+        """
+        for task_id, bid in list(self.winningBidList.items()):
+            if bid != LOCKED_BID:
+                continue
+            if self.winningAgentList.get(task_id) != robot.robot_id:
+                continue          # somebody else's lock; consensus owns it
+            if robot.task_id == task_id:
+                continue          # still in the hole: the lock is real
+            self.winningBidList[task_id] = NOBID
+            self.winningAgentList[task_id] = None
+
     def _clamped_gain(self, task_id: int, raw: float) -> float:
         """Lemma 4: c_ij(t) = min(c_ij_raw(t), c_ij(t-1)).
 
@@ -479,11 +514,18 @@ class CBBAAgent:
     # -------------------------------------------------------------- #
     # Phase 2: conflict resolution (Algorithm 2 + Table I)
     # -------------------------------------------------------------- #
-    def resolveConflicts(self, robot, receivedMessages) -> bool:
+    def resolveConflicts(self, robot, receivedMessages, now: int) -> bool:
         """Returns True if anything changed, i.e. another round is
-        needed before the fleet has converged."""
+        needed before the fleet has converged.
+
+        `now` is the auction clock, and it MUST be the same one
+        broadcast() stamps with. It used to read model.tick here while
+        broadcast stamped the round index, so s_i[me] counted 1, 2, 3...
+        and s_i[neighbour] counted 85, 86... -- Eq. (5) comparing two
+        different units. newer(m) was then meaningless, which matters in
+        every third-agent branch of Table I, i.e. precisely when
+        comm_range is finite and the fleet is not a complete graph."""
         i = robot.robot_id
-        now = robot.model.tick
         changed = False
 
         for msg in receivedMessages:
@@ -540,6 +582,7 @@ class CBBAAgent:
         """Drop finished tasks, and tasks another robot is executing,
         from the bundle and path. With persistent bundles this is what
         keeps them from accumulating stale ids forever."""
+        self._releaseStaleLocks(robot)
         keep = []
         for task_id in self.bundle:
             task = model.tasks.get(task_id)
@@ -569,6 +612,10 @@ class CBBAAllocator(Allocator):
         self.last_round = 0
         self.converged = False
         self._signature = None
+        # Monotone across the WHOLE run, not per auction: round indices
+        # restart at 1 every tick, so they cannot order information that
+        # was learned in an earlier tick.
+        self._clock = 0
 
     def _trigger(self, model, robots, open_tasks):
         """Re-auction only on a change in the situation: a robot freed
@@ -616,11 +663,12 @@ class CBBAAllocator(Allocator):
         self.converged = False
         self.last_round = 0
         for rnd in range(1, max_rounds + 1):
+            self._clock += 1
             for robot in robots:
                 robot.CBBA.createBundle(model, robot)
-                robot.CBBA.broadcast(robot, rnd)
+                robot.CBBA.broadcast(robot, self._clock)
             model.comms.flush_and_deliver(model.tick)
-            changed = [r.CBBA.resolveConflicts(r, r.receive_all())
+            changed = [r.CBBA.resolveConflicts(r, r.receive_all(), self._clock)
                        for r in robots]
             self.last_round = rnd
             if not any(changed):
@@ -643,9 +691,16 @@ class CBBAAllocator(Allocator):
                     _dbg(1, f"[AUCTION]   R{robot.robot_id} starts {task_id}, "
                             f"bundle={robot.CBBA.bundle}")
                     break
+                # assign() refused: no reachable dig cell, or no dump
+                # reachable from it. Dropping it from bundle/path while
+                # LEAVING z pointing at this robot advertised a claim it
+                # had already given up, and y_ij then blocked every other
+                # robot from bidding on it.
                 robot.CBBA.path.remove(task_id)
                 if task_id in robot.CBBA.bundle:
                     robot.CBBA.bundle.remove(task_id)
+                robot.CBBA.winningBidList[task_id] = NOBID
+                robot.CBBA.winningAgentList[task_id] = None
 
 
 ALLOCATORS = {a.name: a for a in (GreedyAllocator, CBBAAllocator,

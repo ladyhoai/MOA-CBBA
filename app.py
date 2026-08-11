@@ -3,15 +3,31 @@
 Run with:
     solara run app.py          # then open http://localhost:8765
 
-Two tabs:
+Three tabs:
   Page 0 — operations view (proposal Fig. 1): grid map, system metrics,
            robot list, task list. All update live every tick.
   Page 1 — time series: tasks done, total energy, mean idle ratio.
+  Page 2 — DEBUG: invariant checks, allocator internals, bid-vs-actual
+           cost accounting, and the event log.
 
 Sliders/seed/allocator take effect on Reset. Cards can be dragged and
 resized by grabbing their edges (layout resets on page reload).
+
+DEBUGGING. The map answers "where is everyone"; it does not answer "why
+is that robot not moving". The overlays (Debug section on Page 0) and
+Page 2 answer the second question:
+  - planned routes show where a robot THINKS it is going, so a robot
+    with no line is a robot with no plan;
+  - p*/q* markers show the dig and unload cells the bid was priced on;
+  - a red ring marks robots that are blocked or have an empty path;
+  - Page 2 lists the invariants that are currently violated, with the
+    reason spelled out, plus what each finished chunk cost against what
+    its bid promised.
+All of it is read-only: excavsim.debug consumes no RNG, so a run with
+the dashboard open is bit-identical to a headless batch run.
 """
 
+import matplotlib.patheffects as patheffects
 import matplotlib.pyplot as plt
 import pandas as pd
 import solara
@@ -25,6 +41,8 @@ from excavsim.model import ExcavationModel, TaskMarker
 from excavsim.bidding import Stage
 from excavsim.terrain import HARDNESS, Terrain
 from excavsim.dynamics import WEATHER
+from excavsim.debug import (ERROR, INFO, LEVEL_NAME, TRACE, WARN, attach,
+                            snapshot_text)
 
 COMPACT_CSS = """
 .v-application h1, .v-application h2, .v-application h3,
@@ -41,11 +59,23 @@ show_layer = solara.reactive("terrain")
 sel_x = solara.reactive(0)
 sel_y = solara.reactive(0)
 
+# --- debug overlay switches ---------------------------------------- #
+dbg_on = solara.reactive(True)        # master switch for every overlay
+dbg_paths = solara.reactive(True)     # planned A* routes
+dbg_targets = solara.reactive(True)   # p* (dig cell) and q* (unload cell)
+dbg_ids = solara.reactive(True)       # R0.. / T0.. labels
+dbg_blocked = solara.reactive(False)  # everything blocked_cells() returns
+dbg_comms = solara.reactive(False)    # who can hear whom
+dbg_focus = solara.reactive("all")    # "all" or "R3": draw one robot only
+log_level = solara.reactive("info")   # event-log threshold
+
+
 def refresh_map():
     """Force the map to redraw AND re-apply post_process (which is what
     paints the selection box; Mesa's redraw clears all patches)."""
     renderer._post_process_applied = False
     update_counter.value += 1
+
 
 _SEL_TAG = "_cell_selection"
 
@@ -64,6 +94,20 @@ STAGE_COLORS = {
     Stage.UNLOAD: "#9b59b6",
 }
 
+# One stable colour per robot, so a route on the map and a row in the
+# debug table are obviously the same machine.
+_TAB10 = plt.get_cmap("tab10")
+
+# white outline: labels have to stay readable over dark rock and bright
+# soil alike, and the map has both in every frame
+_HALO = [patheffects.withStroke(linewidth=2.0, foreground="white")]
+
+
+def robot_color(robot_id: int) -> str:
+    from matplotlib.colors import to_hex
+    return to_hex(_TAB10(robot_id % 10))
+
+
 def _next_task(r):
     cbba = getattr(r, "CBBA", None)
     if cbba is not None and getattr(cbba, "path", None):
@@ -77,6 +121,7 @@ def _next_task(r):
                 and cbpae.bidTask != r.task_id:
             return f"T{cbpae.bidTask}"
     return "-"
+
 
 def agent_portrayal(agent):
     if isinstance(agent, TaskMarker):
@@ -141,6 +186,7 @@ def task_frame(model) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
 @solara.component
 def CellInspector(model):
     update_counter.get()
@@ -151,6 +197,7 @@ def CellInspector(model):
     c = (x, y)
 
     solara.Markdown("**Inspector**")
+
     def set_x(v):
         sel_x.value = v
         refresh_map()
@@ -224,6 +271,11 @@ def CellInspector(model):
             ("metres climbed", f"{robot.metres_climbed:.2f}"),
             ("wait ticks", robot.wait_ticks),
             ("distance", f"{robot.distance_travelled:.0f} steps"),
+            # --- debug: what the mover is actually doing right now --- #
+            ("dest / steps left",
+             f"{robot._dest} / {len(robot._path)}"),
+            ("stuck counter", robot._stuck),
+            ("p* / q*", f"{robot.work_cell} / {robot.dump_cell}"),
             ("bundle b_i", robot.CBBA.bundle or "—"),
             ("path p_i", robot.CBBA.path or "—"),
             ("cbpae bid", "—" if robot.CBPAE.bidTask is None
@@ -235,13 +287,15 @@ def CellInspector(model):
     body = "\n".join(f"| {k} | {v} |" for k, v in rows)
     solara.Markdown(f"| | |\n|---|---|\n{body}")
 
+
 @solara.component
 def SidePanel(model):
     solara.Style(COMPACT_CSS)
     update_counter.get()
     globals()["_current_model"] = model
     renderer._post_process_applied = False
-    # print(f"[stash] model id={id(model)} obstacles={len(model.dynamics.obstacles)}")
+    mon = attach(model)
+
     def pick(value):
         show_layer.value = value
         refresh_map()
@@ -274,16 +328,161 @@ def SidePanel(model):
             f"**weather** {weather_txt} &nbsp;|&nbsp; "
             f"**hazards** {len(d.hazards)} ({hazard_cells} cells) &nbsp;|&nbsp; "
             f"**obstacles** {len(d.obstacles)} &nbsp;|&nbsp; "
-            f"**changed** {len(model.changed_cells)}")
+            f"**changed** {mon.changed_cells_last}")
+
+        # --- health line: the one-glance "is anything wrong" ---------- #
+        HealthLine(mon)
+
+        # --- overlay switches ---------------------------------------- #
+        DebugSwitches(model)
 
         mix = " ".join(f"{k}x{v}" for k, v in sorted(model.fleet_summary.items()))
         solara.Markdown(f"**Robots** &nbsp; _fleet: {model.fleet_mode} ({mix})_")
         solara.DataFrame(robot_frame(model), items_per_page=12)
         solara.Markdown("**Tasks**")
-        solara.DataFrame(task_frame(model), items_per_page=10)# Assembly
+        solara.DataFrame(task_frame(model), items_per_page=10)
+
+
+@solara.component
+def HealthLine(mon):
+    """Red/amber/green, plus the single most severe open complaint."""
+    errs = [t for lv, t in mon.checks if lv >= ERROR]
+    warns = [t for lv, t in mon.checks if lv == WARN]
+    if errs:
+        solara.Markdown(f"🔴 **{len(errs)} error(s), {len(warns)} warning(s)** "
+                        f"— {errs[0]}")
+    elif warns:
+        solara.Markdown(f"🟠 **{len(warns)} warning(s)** — {warns[0]}")
+    else:
+        solara.Markdown("🟢 **checks clear**")
+
+
+@solara.component
+def DebugSwitches(model):
+    def toggle(reactive):
+        def _set(v):
+            reactive.value = v
+            refresh_map()
+        return _set
+
+    def set_focus(v):
+        dbg_focus.value = v
+        refresh_map()
+
+    with solara.Details("Debug overlays", expand=True):
+        solara.Checkbox(label="overlays on", value=dbg_on.value,
+                        on_value=toggle(dbg_on))
+        with solara.Row(gap="6px"):
+            solara.Checkbox(label="routes", value=dbg_paths.value,
+                            on_value=toggle(dbg_paths))
+            solara.Checkbox(label="p*/q*", value=dbg_targets.value,
+                            on_value=toggle(dbg_targets))
+            solara.Checkbox(label="ids", value=dbg_ids.value,
+                            on_value=toggle(dbg_ids))
+        with solara.Row(gap="6px"):
+            solara.Checkbox(label="blocked", value=dbg_blocked.value,
+                            on_value=toggle(dbg_blocked))
+            solara.Checkbox(label="comm links", value=dbg_comms.value,
+                            on_value=toggle(dbg_comms))
+        solara.ToggleButtonsSingle(
+            value=dbg_focus.value,
+            values=["all"] + [f"R{r.robot_id}" for r in model.robots],
+            on_value=set_focus, dense=True)
+
+
+# ------------------------------------------------------------------ #
+# Page 2 — debug
+# ------------------------------------------------------------------ #
+def _events_frame(mon, min_level: int, robot: int | None) -> pd.DataFrame:
+    rows = [{"tick": e.tick,
+             "lvl": LEVEL_NAME[e.level],
+             "robot": "—" if e.robot is None else f"R{e.robot}",
+             "kind": e.kind,
+             "what": e.text}
+            for e in mon.recent(200, min_level, robot)]
+    return pd.DataFrame(rows or [{"tick": "—", "lvl": "—", "robot": "—",
+                                  "kind": "—", "what": "nothing logged yet"}])
+
+
+@solara.component
+def DebugPanel(model):
+    solara.Style(COMPACT_CSS)
+    update_counter.get()
+    globals()["_current_model"] = model
+    mon = attach(model)
+
+    s = mon.summary()
+    a = mon.allocator_state()
+    acc = mon.accuracy_summary()
+
+    with solara.Column(gap="2px"):
+        solara.Markdown("### Debug")
+        HealthLine(mon)
+
+        solara.Markdown(
+            f"**tick** {s['tick']} &nbsp;|&nbsp; **idle** {s['idle_robots']}/{len(model.robots)}"
+            f" &nbsp;|&nbsp; **pending** {s['pending_tasks']}"
+            f" &nbsp;|&nbsp; **reserved** {s['reserved_tasks']}"
+            f" &nbsp;|&nbsp; **left** {s['unfinished_tasks']}"
+            f" &nbsp;|&nbsp; **frozen for** {s['stalled_for']} ticks")
+        solara.Markdown(
+            f"**{s['tick_ms']:.1f} ms/tick** ({s['alloc_share']:.0f}% of it in "
+            f"the allocator, {s['alloc_ms']:.1f} ms) &nbsp;|&nbsp; "
+            f"**changed cells** {s['changed_cells']}")
+        solara.Markdown("**allocator** &nbsp; "
+                        + " &nbsp;|&nbsp; ".join(f"{k} `{v}`"
+                                                 for k, v in a.items()))
+        if acc:
+            solara.Markdown(
+                f"**bid vs actual** over {acc['n']} finished chunk(s): "
+                f"time ×{acc['tau_ratio_min']:.2f} / "
+                f"×{acc['tau_ratio_mean']:.2f} / "
+                f"×{acc['tau_ratio_max']:.2f} &nbsp;|&nbsp; "
+                f"energy ×{acc['e_ratio_min']:.2f} / "
+                f"×{acc['e_ratio_mean']:.2f} / "
+                f"×{acc['e_ratio_max']:.2f} &nbsp; _(min/mean/max)_  \n"
+                f"_×1.00 means the simulation cost exactly what the bid "
+                f"promised. Above 1 is contention, re-routes or drift "
+                f"between costs.py and robot.py. **Below 1 breaks the "
+                f"invariant in the direction costs.py does not document** "
+                f"— usually a reroute that found a cheaper p\\* or q\\* "
+                f"than the one the bid was priced on._")
+
+        # --- open complaints, in full --------------------------------- #
+        if mon.checks:
+            body = "\n".join(
+                f"- {'🔴' if lv >= ERROR else '🟠' if lv == WARN else '·'} {txt}"
+                for lv, txt in mon.checks)
+            solara.Markdown(f"**Checks**\n\n{body}")
+        else:
+            solara.Markdown("**Checks** — all clear")
+
+        solara.Markdown("**Robots** _(internal state the ops table hides)_")
+        solara.DataFrame(pd.DataFrame(mon.robot_debug_rows()), items_per_page=12)
+
+        solara.Markdown("**Chunks** _(`claims` = who holds it in y/z, which "
+                        "is not the same as who is executing it)_")
+        solara.DataFrame(pd.DataFrame(mon.task_debug_rows()), items_per_page=10)
+
+        # --- event log ------------------------------------------------ #
+        with solara.Row(gap="6px"):
+            solara.Markdown("**Event log**")
+            solara.ToggleButtonsSingle(
+                value=log_level.value,
+                values=["trace", "info", "warn"],
+                on_value=lambda v: log_level.set(v), dense=True)
+            solara.Button("print full state to terminal", dense=True,
+                          on_click=lambda: print(snapshot_text(model, 40)))
+        level = {"trace": TRACE, "info": INFO, "warn": WARN}[log_level.value]
+        focus = None if dbg_focus.value == "all" else int(dbg_focus.value[1:])
+        solara.DataFrame(_events_frame(mon, level, focus), items_per_page=20)
+
+
+# ------------------------------------------------------------------ #
+# Assembly
 # ------------------------------------------------------------------ #
 model_instance = ExcavationModel(
-    seed=42, allocator="cbpae", max_sharers=4,
+    seed=42, allocator="greedy", max_sharers=4,
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
     hazard_rate=0.05, hazard_size=2, hazard_duration=5,
@@ -294,6 +493,7 @@ renderer.setup_propertylayer(layer_portrayal)
 renderer.setup_agents(agent_portrayal)
 renderer.render()  # REQUIRED: sets the meshes SolaraViz redraws each frame
 
+
 def _live_model():
     """The model the UI is currently showing. SidePanel stashes it each
     render, so this follows Reset even when renderer.space.model is None."""
@@ -303,24 +503,37 @@ def _live_model():
     space = getattr(renderer, "space", None)
     return getattr(space, "model", None) or model_instance
 
+
+def _clear(ax, tag: str) -> None:
+    """Remove every artist this module drew under `tag`. Matplotlib keeps
+    lines, patches, collections and texts in separate lists and the
+    renderer only clears some of them, so overlays stack up over frames
+    unless each family is swept."""
+    for seq in (ax.lines, ax.patches, ax.collections, ax.texts):
+        for art in list(seq):
+            if getattr(art, "_gid", None) == tag:
+                art.remove()
+
+
+def _focused(robot) -> bool:
+    return (dbg_focus.value == "all"
+            or dbg_focus.value == f"R{robot.robot_id}")
+
+
 def _draw_selection(ax):
     """Red box on the selected cell. Removes any previous box first so
     repeated calls don't stack patches."""
-    for p in list(ax.patches):
-        if getattr(p, "_gid", None) == _SEL_TAG:
-            p.remove()
+    _clear(ax, _SEL_TAG)
     rect = plt.Rectangle((sel_x.value - 0.5, sel_y.value - 0.5), 1, 1,
                          fill=False, ec="red", lw=2.0, zorder=10)
     rect._gid = _SEL_TAG
     ax.add_patch(rect)
 
+
 def _draw_hazards(ax):
     """Red wash on active hazard-zone cells, re-added each frame
     (the renderer clears patches between frames)."""
-    import matplotlib.pyplot as plt
-    for p in list(ax.patches):
-        if getattr(p, "_gid", None) == "_hazard":
-            p.remove()
+    _clear(ax, "_hazard")
     dyn = getattr(_live_model(), "dynamics", None)
     if dyn is None:
         return
@@ -332,20 +545,140 @@ def _draw_hazards(ax):
             rect._gid = "_hazard"
             ax.add_patch(rect)
 
+
 def _draw_obstacles(ax):
     """drawing red triangles as dynamic obstacles"""
-    for coll in list(ax.collections):
-        if getattr(coll, "_gid", None) == "_obstacles":
-            coll.remove()
+    _clear(ax, "_obstacles")
     obs = getattr(_live_model(), "dynamics", None)
-    # print(f"[draw] live model id={id(_live_model())} obstacles={0 if obs is None else len(obs.obstacles)}")
-
     if obs is None or not obs.obstacles:
         return
     xs = [o.cell[0] for o in obs.obstacles]
     ys = [o.cell[1] for o in obs.obstacles]
-    sc = ax.scatter(xs, ys, marker="^", s=140, c="#e74c3c", edgecolors="black", linewidths=1.0, zorder=11)
+    sc = ax.scatter(xs, ys, marker="^", s=140, c="#e74c3c",
+                    edgecolors="black", linewidths=1.0, zorder=11)
     sc._gid = "_obstacles"
+
+
+# ------------------------------------------------------------------ #
+# debug overlays
+# ------------------------------------------------------------------ #
+def _draw_blocked(ax, model):
+    """Everything A* refuses to route through THIS tick. A route that
+    looks absurd usually makes sense once you can see what it is going
+    around."""
+    _clear(ax, "_dbg_blocked")
+    if not (dbg_on.value and dbg_blocked.value):
+        return
+    for (x, y) in model.blocked_cells():
+        rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
+                             hatch="///", edgecolor="#222222", lw=0.0,
+                             alpha=0.45, zorder=7)
+        rect._gid = "_dbg_blocked"
+        ax.add_patch(rect)
+
+
+def _draw_paths(ax, model):
+    """The remaining A* route per robot, from where it stands now."""
+    _clear(ax, "_dbg_path")
+    if not (dbg_on.value and dbg_paths.value):
+        return
+    for r in model.robots:
+        if not r._path or not _focused(r):
+            continue
+        xs = [r.cell.coordinate[0]] + [c[0] for c in r._path]
+        ys = [r.cell.coordinate[1]] + [c[1] for c in r._path]
+        line, = ax.plot(xs, ys, ls="--", lw=1.8, color=robot_color(r.robot_id),
+                        alpha=0.95, zorder=8, solid_capstyle="round")
+        line._gid = "_dbg_path"
+
+
+def _draw_targets(ax, model):
+    """p* (the dig cell the bid was priced from) and q* (the unload
+    cell). If a robot is walking somewhere that is neither, its leg was
+    re-planned and the bid no longer describes what it is doing."""
+    _clear(ax, "_dbg_target")
+    if not (dbg_on.value and dbg_targets.value):
+        return
+    for r in model.robots:
+        if not _focused(r):
+            continue
+        col = robot_color(r.robot_id)
+        if r.work_cell is not None:
+            sc = ax.scatter([r.work_cell[0]], [r.work_cell[1]], marker="x",
+                            s=110, c=col, linewidths=2.0, zorder=12)
+            sc._gid = "_dbg_target"
+        if r.dump_cell is not None:
+            sc = ax.scatter([r.dump_cell[0]], [r.dump_cell[1]], marker="*",
+                            s=150, c=col, edgecolors="black", linewidths=0.5,
+                            zorder=12)
+            sc._gid = "_dbg_target"
+
+
+def _draw_alerts(ax, model):
+    """Ring the robots that are in trouble: blocked by a neighbour, or
+    committed to a leg with no route to walk. These are the ones that
+    look identical to a healthy robot on the plain map."""
+    _clear(ax, "_dbg_alert")
+    if not dbg_on.value:
+        return
+    for r in model.robots:
+        stalled = (r.stage in (Stage.TO_TASK, Stage.TO_DUMP) and not r._path)
+        if not (r._stuck or stalled):
+            continue
+        x, y = r.cell.coordinate
+        ring = plt.Circle((x, y), 0.52, fill=False,
+                          ec="#ff2d55" if stalled else "#ffb300",
+                          lw=2.2, zorder=13)
+        ring._gid = "_dbg_alert"
+        ax.add_patch(ring)
+
+
+def _draw_ids(ax, model):
+    """R# next to each robot in its own colour, T# on each chunk cell."""
+    _clear(ax, "_dbg_id")
+    if not (dbg_on.value and dbg_ids.value):
+        return
+    for r in model.robots:
+        x, y = r.cell.coordinate
+        txt = ax.text(x + 0.45, y + 0.45, f"R{r.robot_id}", fontsize=9,
+                      color=robot_color(r.robot_id), zorder=14,
+                      ha="left", va="bottom", weight="bold")
+        txt.set_path_effects(_HALO)
+        txt._gid = "_dbg_id"
+    by_cell: dict = {}
+    for t in model.tasks.unfinished:
+        by_cell.setdefault(t.cell, []).append(t.task_id)
+    for (x, y), ids in by_cell.items():
+        label = ",".join(f"T{i}" for i in ids[:2]) + ("…" if len(ids) > 2 else "")
+        txt = ax.text(x - 0.48, y - 0.5, label, fontsize=7, color="#1a1a1a",
+                      zorder=14, ha="left", va="top")
+        txt.set_path_effects(_HALO)
+        txt._gid = "_dbg_id"
+
+
+def _draw_comms(ax, model):
+    """Who can hear whom. Only meaningful with a finite comm_range —
+    with the default (None) every robot hears every other and the mesh
+    would just be noise."""
+    _clear(ax, "_dbg_comm")
+    if not (dbg_on.value and dbg_comms.value):
+        return
+    comms = getattr(model, "comms", None)
+    if comms is None or comms.comm_range is None:
+        return
+    seen = set()
+    for r in model.robots:
+        for other in comms.neighbors(r):
+            key = tuple(sorted((r.robot_id, other.robot_id)))
+            if key in seen:
+                continue
+            seen.add(key)
+            ax_, ay = r.cell.coordinate
+            bx, by = other.cell.coordinate
+            line, = ax.plot([ax_, bx], [ay, by], ls=":", lw=0.9,
+                            color="#00b894", alpha=0.7, zorder=6)
+            line._gid = "_dbg_comm"
+
 
 def fit_canvas(ax):
     """Applied once per renderer via post_process — and copy_renderer
@@ -355,6 +688,22 @@ def fit_canvas(ax):
     _draw_selection(ax)
     _draw_hazards(ax)
     _draw_obstacles(ax)
+
+    model = _live_model()
+    if model is None:
+        return
+    # Overlays must not be able to take the dashboard down: a debug view
+    # that crashes the run it is debugging is worse than no debug view.
+    try:
+        _draw_blocked(ax, model)
+        _draw_comms(ax, model)
+        _draw_paths(ax, model)
+        _draw_targets(ax, model)
+        _draw_alerts(ax, model)
+        _draw_ids(ax, model)
+    except Exception as exc:                      # pragma: no cover
+        print(f"[debug overlay] {type(exc).__name__}: {exc}")
+
 
 renderer.post_process = fit_canvas
 fit_canvas(renderer.canvas)      # apply to the initial frame too
@@ -393,6 +742,8 @@ page = SolaraViz(
         make_plot_component("tasks_done", page=1),
         make_plot_component("total_energy", page=1),
         make_plot_component("mean_idle_ratio", page=1),
+        # Page 2 — debug
+        (DebugPanel, 2),
     ],
     model_params=model_params,
     name="excavsim — Phase 1",

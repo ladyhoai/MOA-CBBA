@@ -85,6 +85,9 @@ class CBPAEAgent:
 
         # Sec. 3.7.2/3.7.3: messages processed without losing the bid.
         self.msg_count = 0
+        # what tExec(t) was won for, so a task that has become far more
+        # expensive than it was bid at can be recognised (dropIfTooCostly)
+        self.execBid = NOCOST
 
     # -------------------------------------------------------------- #
     # accessors with Table 3 defaults
@@ -168,28 +171,70 @@ class CBPAEAgent:
 
         # Fig. 2: if tBid(t) != tBid(t-1), release the old bid first.
         if self.prevBidTask is not None and self.prevBidTask != self.bidTask:
-            self.release(self.prevBidTask, robot.robot_id)
+            self.release(self.prevBidTask, robot.robot_id, now)
         if self.bidTask is not None:
             self.placeBid(self.bidTask, best_v, robot.robot_id, now)
         return self.bidTask, best_v
 
     def placeBid(self, j, value, me, now) -> None:
+        """Record my bid on j (Table 3 fields b, a, tb).
+
+        Two things are deliberately NOT reset when I merely IMPROVE a bid
+        I already hold, and both of them are load-bearing for Eq. (7).
+
+        `msg_count` counts messages processed WITHOUT LOSING the bid
+        (Sec. 3.7.2). Improving your own bid loses nothing. Zeroing it on
+        every rewrite made the paper's central mechanism self-defeating:
+        residual_cost shrinks every round while a robot executes, so a
+        mid-execution bidder rewrote its bid every round, zeroed the
+        counter every round, and could not reach tryAssign's quorum until
+        it went idle and its bid finally went static. The visible symptom
+        is a ~3-tick dead gap after every completion before the next
+        assignment -- paid once per chunk, by every robot, all run.
+
+        `tb` opens the bidding window, which exists to give rivals time to
+        contest (Sec. 3.7.3). A strictly better bid from the same holder
+        gives them nothing new to contest, so restarting the window on an
+        improvement only delays the commit. A WORSE bid can be beaten, so
+        that one does re-open it.
+        """
         if self._winner(j) == me and abs(self._bid(j) - value) <= EPS:
             return                       # unchanged: no vector edit
+        fresh_claim = self._winner(j) != me
+        worse = (not fresh_claim) and value > self._bid(j) + EPS
         self.B[j] = value
         self.A[j] = me
-        self.TB[j] = now
+        if fresh_claim or worse or self._tb(j) == NOTB:
+            self.TB[j] = now
         if self._status(j) not in (NALC, DROP):
             self.E[j] = NALC
-        self.msg_count = 0
+        if fresh_claim or worse:
+            self.msg_count = 0
 
-    def release(self, j, me) -> None:
-        """Table 4, Release: b = NBID, a = NBID, e = NALC."""
+    def release(self, j, me, now: int | None = None) -> None:
+        """Table 4, Release: b = NBID, a = NBID, e = NALC.
+
+        The release must carry a FRESH bid time. Table 6's NALC/NALC row
+        adopts a sender's `a_k is NBID` only when tb_k >= tb_n, so a
+        release broadcast with the ORIGINAL bid's timestamp loses every
+        race against a receiver that has since bumped tb_n through
+        updatebidtime. The releasing robot then walks away while every
+        other robot goes on believing it still holds the task at a bid
+        nobody can beat. The chunk is never bid on again, no assign is
+        ever attempted, and the fleet is in perfect agreement about a
+        fiction -- which is the one failure mode Tables 5-7 cannot fix,
+        because there is no disagreement left to resolve.
+
+        `now` is optional only so that an external caller cannot break;
+        every internal call site passes it.
+        """
         if self._winner(j) != me:
             return
         self.B[j] = NOCOST
         self.A[j] = NBID
         self.E[j] = NALC
+        if now is not None:
+            self.TB[j] = now
         if self.bidTask == j:
             self.bidTask = None
 
@@ -351,7 +396,7 @@ class CBPAEAgent:
             changed = True
 
         if "release" in actions:
-            self.release(j, n)
+            self.release(j, n, now)
             self.msg_count = 0
             changed = True
 
@@ -398,10 +443,61 @@ class CBPAEAgent:
             self.E[j] = EXEC
             self.A[j] = robot.robot_id
         elif self.execTask is not None:
-            self.prevExecTask = self.execTask
-            if model.tasks.get(self.execTask).done:
-                self.E[self.execTask] = FNSH
+            j = self.execTask
+            self.prevExecTask = j
+            if model.tasks.get(j).done:
+                self.E[j] = FNSH
+            else:
+                # I stopped executing WITHOUT finishing. Leaving e = EXEC
+                # here is fatal and silent: the chunk is unassigned in the
+                # registry but excluded from freeTasks forever, so no bid
+                # is placed, tryAssign is never reached, and no ASSIGN-FAIL
+                # is ever logged. Worse, prevExecTask keeps BROADCASTING
+                # that EXEC, and Table 6 (e_k == EXEC over e_n == NALC ->
+                # Update) spreads it to the whole fleet. Every robot then
+                # agrees the chunk is being worked and consensus defends
+                # the fiction indefinitely.
+                #
+                # robot.py reaches this state without ever calling
+                # abandon_task(): _go_dump() calls _finish_task() when no
+                # dump is reachable, and _dig_tick() does the same for
+                # non-diggable terrain. Both clear task_id with volume
+                # still in the ground. Table 4 calls that a Drop, so this
+                # records a Drop -- with a drop time, which is what lets
+                # Tables 5 and 6 propagate it.
+                self.E[j] = DROP
+                self.A[j] = NBID
+                self.B[j] = NOCOST
+                self.TD[j] = now
+            self.execBid = NOCOST
             self.execTask = None
+
+        self._reconcile(model, robot, now)
+
+    def _reconcile(self, model, robot, now: int) -> None:
+        """Repair local vectors against what the robot can actually see.
+
+        Tables 5-7 resolve DISAGREEMENT. A vector that is wrong the same
+        way on every robot is converged, and consensus will defend it for
+        the rest of the run. These two rules are the ground truth: an
+        empty dig site is visible from the site, and tryAssign already
+        reads task.assigned_to directly, so this adds no omniscience that
+        was not in the file already.
+        """
+        for t in model.tasks.unfinished:
+            j = t.task_id
+            if t.assigned_to is None:
+                if self._status(j) == EXEC:      # nobody is working it
+                    self.E[j] = NALC
+                    self.A[j] = NBID
+                    self.B[j] = NOCOST
+                    self.TB[j] = now
+            elif self._status(j) != EXEC:        # somebody demonstrably is
+                self.E[j] = EXEC
+                self.A[j] = t.assigned_to
+                self.TB[j] = now
+                if self.bidTask == j:
+                    self.bidTask = None
 
     def dropIfUnreachable(self, model, robot, now: int) -> bool:
         """Sec. 3.7.4: a robot may abandon a task, but only during the
@@ -426,6 +522,41 @@ class CBPAEAgent:
         self.prevExecTask, self.execTask = j, None
         return True
 
+    def dropIfTooCostly(self, model, robot, now: int,
+                        ratio: float | None) -> bool:
+        """Phase-4 generalisation of dropIfUnreachable. OFF by default.
+
+        dropIfUnreachable only fires when the target has become
+        IMPOSSIBLE. A hazard that merely forces a long detour leaves a
+        robot crawling towards a chunk it would never have won at the new
+        price, with the chunk reserved and everyone else idle. Checked in
+        execution phase 1 only (via can_abandon), so the task state is
+        untouched and it stays reallocatable -- the Sec. 3.7.4 condition.
+
+        This is a SCOPE DECISION, not a bug fix. The paper's trigger is an
+        emergency task and excavation has no priorities, so `ratio=None`
+        reproduces the strict-paper behaviour exactly. If you switch it
+        on, say so in the report and quote the ratio you used.
+        """
+        if ratio is None or not robot.can_abandon:
+            return False
+        if self.execBid >= NOCOST or self.execBid <= EPS:
+            return False
+        j = robot.task_id
+        tau, e, q = leg_cost(model, robot, model.tasks.get(j))
+        if q is None:
+            return False          # unreachable is dropIfUnreachable's job
+        if model.w1 * tau + model.w2 * e <= self.execBid * ratio:
+            return False
+        robot.abandon_task()
+        self.E[j] = DROP
+        self.A[j] = NBID
+        self.B[j] = NOCOST
+        self.TD[j] = now
+        self.prevExecTask, self.execTask = j, None
+        self.execBid = NOCOST
+        return True
+
     # -------------------------------------------------------------- #
     # Sec. 3.7.3: task assignment
     # -------------------------------------------------------------- #
@@ -444,6 +575,10 @@ class CBPAEAgent:
         task = model.tasks.get(j)
         if task.done or task.assigned_to is not None:
             self.E[j] = FNSH if task.done else EXEC
+            if not task.done:
+                # a stands for "who holds it", and that is now demonstrably
+                # not me; leaving a = me here leaks a claim nobody can beat
+                self.A[j] = task.assigned_to
             self.bidTask = None
             return False
 
@@ -465,10 +600,11 @@ class CBPAEAgent:
             if not task.done and task.assigned_to is not None:
                 self.E[j] = EXEC
                 self.A[j] = task.assigned_to
-            self.release(j, robot.robot_id)
+            self.release(j, robot.robot_id, now)
             self.bidTask = None
             return False
         self.E[j] = EXEC
+        self.execBid = self._bid(j)   # the price I won at, for dropIfTooCostly
         self.prevExecTask = self.execTask
         self.execTask = j
         self.bidTask = None
@@ -481,8 +617,10 @@ class CBPAEAllocator:
 
     name = "cbpae"
 
-    def __init__(self) -> None:
+    def __init__(self, drop_cost_ratio: float | None = None) -> None:
         self.round = 0
+        # None == strict paper behaviour; see dropIfTooCostly
+        self.drop_cost_ratio = drop_cost_ratio
 
     def allocate(self, model: "ExcavationModel") -> None:
         self.round += 1
@@ -491,6 +629,7 @@ class CBPAEAllocator:
         for r in model.robots:
             r.CBPAE.syncExecution(model, r, now)
             r.CBPAE.dropIfUnreachable(model, r, now)
+            r.CBPAE.dropIfTooCostly(model, r, now, self.drop_cost_ratio)
             r.CBPAE.computeBid(model, r, now)
             r.CBPAE.broadcast(r, now)
 

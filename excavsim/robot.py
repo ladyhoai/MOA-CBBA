@@ -36,6 +36,13 @@ from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMM
 
 STUCK_LIMIT = 2
 
+# Consecutive blocked/no-route ticks before a robot in execution phase 1
+# gives the chunk back. Without this a robot walled off from its target
+# holds the reservation for the rest of the run: CBPAE has
+# dropIfUnreachable, CBBA has no drop path at all, so the release has to
+# exist at the physics layer where it applies to every allocator equally.
+UNREACHABLE_PATIENCE = 20
+
 
 class ExcavatorRobot(CellAgent):
     """One excavation robot. `model` is an ExcavationModel."""
@@ -69,6 +76,7 @@ class ExcavatorRobot(CellAgent):
         self._move_credit = 0.0
         self._unload_left = 0
         self._stuck = 0
+        self._waiting = 0      # consecutive ticks making no progress
 
         self.robot_id = len(model.robots)
 
@@ -136,6 +144,7 @@ class ExcavatorRobot(CellAgent):
         self.dump_cell = dump[0]
         self.task_id = task_id
         task.assigned_to = self.robot_id
+        self._waiting = 0
         self.stage = Stage.TO_TASK
         self._plan_leg(self.work_cell)
         return True
@@ -147,6 +156,19 @@ class ExcavatorRobot(CellAgent):
         phase of execution (travelling to the task), so that the task
         state is unchanged and the task stays reallocatable. Callers
         must check `can_abandon` first."""
+        self._release_task()
+
+    def _release_task(self) -> None:
+        """Return the current chunk to the pool UNFINISHED.
+
+        The counterpart of _finish_task, and the distinction matters:
+        _finish_task stamps completed_tick, which is what makespan reads
+        and what TaskRegistry.all_done tests. Stamping it on a chunk that
+        still has volume in the ground puts a completion that never
+        happened into the headline metric, inflates tasks_completed, and
+        leaves CBPAE holding e = EXEC for a chunk nobody is working.
+
+        Anything that is not "the volume reached zero" ends here."""
         if self.task_id is None:
             return
         task = self.model.tasks.get(self.task_id)
@@ -156,6 +178,8 @@ class ExcavatorRobot(CellAgent):
         self.work_cell = None
         self.dump_cell = None
         self._path = []
+        self._dest = None
+        self._waiting = 0
         self.stage = Stage.IDLE
 
     @property
@@ -212,28 +236,59 @@ class ExcavatorRobot(CellAgent):
 
     def _advance_along_path(self) -> bool:
         """Move up to v_max cells; never enter an occupied cell.
-        Returns True once the destination is reached."""
-        if not self._path:
-            return True
+        Returns True once the destination is REACHED.
+
+        Arrival is `we are standing on _dest`, not `the path list is
+        empty`. Those are different whenever _plan_leg failed, and
+        conflating them was expensive in both directions:
+
+          TO_TASK: a failed plan reported arrival, step() flipped to DIG,
+          _dig_tick found the robot out of range, re-planned, failed
+          again, and the robot ping-ponged between two stages in place
+          for as long as the blockage lasted -- while counting every one
+          of those ticks as busy_ticks, so mean_idle_ratio showed a fully
+          occupied fleet.
+
+          TO_DUMP: worse. A failed plan reported arrival, step() went to
+          UNLOAD, and _unload_tick emptied the hopper wherever the robot
+          happened to be standing -- soil deleted without ever reaching a
+          dump site, and the task possibly closed out on the strength of
+          it."""
         occupied = self._other_robot_cells() | self.model.dynamics.blocked()
+        if not self._path:
+            if self._dest is None or self.cell.coordinate == self._dest:
+                return True
+            self._wait_blocked(occupied)     # no route: wait, do not arrive
+            return False
         self._move_credit += self.spec.v_max
         while self._path and self._move_credit >= 1.0:
             nxt = self._path[0]
             if nxt in occupied:
-                # blocked: wait, forfeit banked motion; re-route if stuck
-                self._move_credit = 0.0
-                self._stuck += 1
-                self.wait_ticks += 1
-                if self._stuck >= STUCK_LIMIT:
-                    self._reroute(occupied)
+                self._wait_blocked(occupied)
                 return False
             currentPosition = self.cell.coordinate
             self._path.pop(0)
             self.move_to(self.model.grid[nxt])
             self._move_credit -= 1.0
             self._stuck = 0
+            self._waiting = 0
             self._spend_move(currentPosition, nxt)  # Eq. 5 travel term
-        return not self._path
+        return (not self._path
+                and (self._dest is None or self.cell.coordinate == self._dest))
+
+    def _wait_blocked(self, occupied: set[tuple[int, int]]) -> None:
+        """One tick of no progress: forfeit banked motion, count the wait,
+        re-route on STUCK_LIMIT, and give the chunk back if this has been
+        going on long enough that nothing is coming of it."""
+        self._move_credit = 0.0
+        self._stuck += 1
+        self._waiting += 1
+        self.wait_ticks += 1
+        if self._waiting >= UNREACHABLE_PATIENCE and self.can_abandon:
+            self._release_task()
+            return
+        if self._stuck >= STUCK_LIMIT:
+            self._reroute(occupied)
 
     # ------------------------------------------------------------------ #
     # work stages
@@ -256,8 +311,17 @@ class ExcavatorRobot(CellAgent):
                 self.dump_cell = found[0]
         dest = (self.work_cell if self.stage is Stage.TO_TASK
                 else self.dump_cell)
-        self._plan_leg(dest if dest is not None else self._dest,
-                       avoid_robots=True)
+        dest = dest if dest is not None else self._dest
+        self._plan_leg(dest, avoid_robots=True)
+        # avoid_robots=True searches a STRICTLY LARGER blocked set than
+        # the plan that just failed, so escalating to it when already
+        # stuck can only ever return the same route or none at all --
+        # "re-planned (10, 7) -> (10, 7); path now 0 steps". Treating
+        # other robots as walls is the optimistic case (they move); fall
+        # back to routing through them rather than surrendering.
+        if not self._path and dest is not None \
+                and self.cell.coordinate != dest:
+            self._plan_leg(dest, avoid_robots=False)
 
     def _dig_tick(self) -> None:
         task = self.model.tasks.get(self.task_id)
@@ -267,8 +331,14 @@ class ExcavatorRobot(CellAgent):
             self.stage = Stage.TO_TASK
             return
         terrain = Terrain(int(self.model.grid.terrain.data[coord]))
-        if terrain not in DIGGABLE or task.done:
+        if task.done:
             self._go_dump() if self.payload > 1e-9 else self._finish_task()
+            return
+        if terrain not in DIGGABLE:
+            # Not diggable and not empty: nobody can ever finish this
+            # chunk. Haul what is in the hopper first, then give the
+            # chunk back UNFINISHED -- it is not a completion.
+            self._go_dump() if self.payload > 1e-9 else self._release_task()
             return
         hardness = HARDNESS[terrain]
         dv = self.spec.dig_rate / hardness            # volume this tick
@@ -284,8 +354,8 @@ class ExcavatorRobot(CellAgent):
     def _go_dump(self) -> None:
         if self.dump_cell is None:  # q* chosen once per task, from p*
             found = self.model.dump_work_cell(self.work_cell)
-            if found is None:       # no dump reachable: abandon safely
-                self._finish_task()
+            if found is None:       # no dump reachable: give it back
+                self._release_task()
                 return
             self.dump_cell, _ = found
         self.stage = Stage.TO_DUMP
@@ -304,7 +374,14 @@ class ExcavatorRobot(CellAgent):
             self._plan_leg(self.work_cell)   # return to the same p*
 
     def _finish_task(self) -> None:
+        """The chunk's volume reached zero. ONLY that."""
         task = self.model.tasks.get(self.task_id)
+        if not task.done:
+            # Safety net for any future call site that gets this wrong:
+            # a completion stamp on a chunk with volume left is a lie the
+            # makespan cannot detect.
+            self._release_task()
+            return
         task.completed_tick = self.model.tick
         task.assigned_to = None
         self.tasks_completed += 1
