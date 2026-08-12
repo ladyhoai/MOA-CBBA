@@ -56,6 +56,21 @@ STALL_TICKS = 25
 _NUM_RE = re.compile(r"\d+")
 
 
+def _bundle_agent(robot):
+    """Whichever bundle-based agent is actually in play. A moa-cbba run
+    leaves robot.CBBA empty, so reading it unconditionally reported an
+    untouched bundle and every CBBA check passed vacuously."""
+    for attr in ("MOACBBA", "CBBA"):
+        agent = getattr(robot, attr, None)
+        if agent is None:
+            continue
+        if (getattr(agent, "bundle", None) or getattr(agent, "path", None)
+                or getattr(agent, "winningAgentList", None)
+                or getattr(agent, "bids", None)):
+            return agent
+    return getattr(robot, "CBBA", None)
+
+
 @dataclass
 class Event:
     tick: int
@@ -78,6 +93,7 @@ class _Prediction:
     tau: float
     e: float
     dist_at_bid: float = 0.0
+    sharers: int = 1
 
 
 @dataclass
@@ -100,6 +116,7 @@ class DebugMonitor:
     _snapshot: dict = field(default_factory=dict)
     _pending_finish: dict = field(default_factory=dict)
     _check_seen: dict = field(default_factory=dict)
+    _abandon_mark: dict = field(default_factory=dict)
     _attached_at: int = 0
     _errors: list = field(default_factory=list)     # monitor's own failures
     enabled: bool = True
@@ -108,6 +125,8 @@ class DebugMonitor:
     # the robot finishes mid-tick and the allocator only runs at the top
     # of the next one. Only a streak means the allocator is stuck.
     idle_grace: int = 3
+    # window over which repeated abandons count as churn
+    churn_window: int = 20
     # ticks before the same check message is worth logging again
     check_cooldown: int = 40
 
@@ -208,24 +227,23 @@ class DebugMonitor:
         #    tasks.pending, so the fleet idles with work outstanding.
         by_robot = {r.robot_id: r for r in m.robots}
         for t in m.tasks.unfinished:
-            if t.assigned_to is None:
-                continue
-            r = by_robot.get(t.assigned_to)
-            if r is None:
-                add((ERROR, f"T{t.task_id} reserved by unknown robot "
-                            f"{t.assigned_to}"))
-            elif r.task_id != t.task_id:
-                add((ERROR, f"T{t.task_id} is reserved by R{t.assigned_to} but "
-                            f"that robot is working "
-                            f"{'nothing' if r.task_id is None else f'T{r.task_id}'} "
-                            f"— chunk is stranded (never appears in pending)"))
+            for rid in sorted(t.assignees):
+                r = by_robot.get(rid)
+                if r is None:
+                    add((ERROR, f"T{t.task_id} seats unknown robot {rid}"))
+                elif r.task_id != t.task_id:
+                    add((ERROR, f"T{t.task_id} seats R{rid} but that robot is "
+                                f"working "
+                                f"{'nothing' if r.task_id is None else f'T{r.task_id}'}"
+                                f" — the seat is stranded and the task can "
+                                f"never fill it again"))
         for r in m.robots:
             if r.task_id is None:
                 continue
             t = m.tasks.get(r.task_id)
-            if t.assigned_to != r.robot_id:
-                add((ERROR, f"R{r.robot_id} is executing T{t.task_id} but "
-                            f"task.assigned_to = {t.assigned_to}"))
+            if r.robot_id not in t.assignees:
+                add((ERROR, f"R{r.robot_id} is executing T{t.task_id} but is "
+                            f"not among its assignees {sorted(t.assignees)}"))
 
         # 2. one robot per cell (the physics rule robot.py documents)
         seen: dict = {}
@@ -325,9 +343,9 @@ class DebugMonitor:
         #     and no two robots may claim the same chunk.
         claims: dict = {}
         for r in m.robots:
-            cb = getattr(r, "CBBA", None)
-            if cb is None:
-                continue
+            cb = _bundle_agent(r)
+            if cb is None or getattr(cb, "winningAgentList", None) is None:
+                continue          # cost-convention agent: no y/z to check
             if set(cb.bundle) != set(cb.path):
                 add((ERROR, f"R{r.robot_id} CBBA bundle/path mismatch: "
                             f"b={cb.bundle} p={cb.path}"))
@@ -372,6 +390,19 @@ class DebugMonitor:
             add((INFO, f"CBPAE: {disagree} task(s) with disagreeing "
                        f"allocation vectors across robots"))
 
+        # 11c. switch churn: abandoning and retaking work every tick is
+        #      indistinguishable from healthy re-allocation in the
+        #      per-tick view, and lethal over a run -- the robot never
+        #      arrives anywhere.
+        for r in m.robots:
+            n = self.count(r.robot_id, "abandon")
+            recent = n - self._abandon_mark.get(r.robot_id, 0)
+            if recent >= 5:
+                add((ERROR, f"R{r.robot_id} has abandoned a task {recent} "
+                            f"times in the last {self.churn_window} ticks — "
+                            f"it is cycling, not re-allocating, and is "
+                            f"unlikely to finish anything"))
+
         # 12. finished-but-unstamped AND unowned. A chunk that is empty
         #     but still owned is normal: the digger is hauling the last
         #     load and stamps completed_tick when it unloads. With no
@@ -398,8 +429,9 @@ class DebugMonitor:
             for r in self.model.robots:
                 if r.task_id is None or r.task_id == j:
                     continue
-                cb = getattr(r, "CBBA", None)
-                if cb is not None and cb.winningAgentList.get(j) == r.robot_id:
+                cb = _bundle_agent(r)
+                wal = getattr(cb, "winningAgentList", None) if cb else None
+                if wal is not None and wal.get(j) == r.robot_id:
                     held[j] = (r.robot_id, "cbba")
                     break
                 cp = getattr(r, "CBPAE", None)
@@ -428,7 +460,7 @@ class DebugMonitor:
     def robot_debug_rows(self) -> list[dict]:
         rows = []
         for r in self.model.robots:
-            cb = getattr(r, "CBBA", None)
+            cb = _bundle_agent(r)
             cp = getattr(r, "CBPAE", None)
             rows.append({
                 "robot": r.robot_id,
@@ -443,8 +475,16 @@ class DebugMonitor:
                 "q*": "—" if r.dump_cell is None else str(r.dump_cell),
                 "bundle": "—" if not cb or not cb.bundle else str(cb.bundle),
                 "cbba path": "—" if not cb or not cb.path else str(cb.path),
-                "wins": 0 if not cb else sum(1 for v in cb.winningAgentList.values()
-                                             if v == r.robot_id),
+                "wins": (sum(1 for v in cb.winningAgentList.values()
+                             if v == r.robot_id)
+                         if getattr(cb, "winningAgentList", None) is not None
+                         else sum(1 for (_j, i), (c, _s)
+                                  in getattr(cb, "bids", {}).items()
+                                  if i == r.robot_id and c < float("inf"))),
+                "shares": (m_task.sharers
+                           if (m_task := (self.model.tasks.get(r.task_id)
+                                          if r.task_id is not None else None))
+                           else 0),
                 "bid/exec": "—" if not cp else
                             f"{'—' if cp.bidTask is None else 'T%d' % cp.bidTask}"
                             f" / "
@@ -463,15 +503,15 @@ class DebugMonitor:
         for t in self.model.tasks.all:
             holders = []
             for r in self.model.robots:
-                cb = getattr(r, "CBBA", None)
-                if cb and cb.winningAgentList.get(t.task_id) == r.robot_id:
+                cb = _bundle_agent(r)
+                wal = getattr(cb, "winningAgentList", None) if cb else None
+                if wal is not None and wal.get(t.task_id) == r.robot_id:
                     holders.append(f"R{r.robot_id}")
             rows.append({
                 "task": f"T{t.task_id}",
-                "site": f"S{t.site_id}",
                 "cell": str(t.cell),
                 "left": round(t.remaining, 3),
-                "assigned": "—" if t.assigned_to is None else f"R{t.assigned_to}",
+                "seats": ",".join(f"R{i}" for i in sorted(t.assignees)) or "—",
                 "claims": ",".join(holders) or "—",
                 "done@": "—" if t.completed_tick is None else t.completed_tick,
             })
@@ -488,14 +528,24 @@ class DebugMonitor:
             tau, e, _q = leg_cost(m, robot, task)
         except Exception:                       # pragma: no cover
             self._note_error()
+        # leg_cost prices the whole remaining volume as a solo job. When
+        # k robots share the task the volume drains ~k times faster, so
+        # comparing that bid against the realised time reported x0.22 --
+        # a four-fold "error" that was really just the accounting
+        # ignoring the co-workers. Recorded so the ratio measures cost
+        # model vs simulation, not solo-pricing vs shared execution.
+        sharers = max(1, len(task.assignees))
         self.predictions[(robot.robot_id, task_id)] = _Prediction(
-            tick=m.tick, energy=robot.energy_used, tau=tau, e=e,
-            dist_at_bid=robot.distance_travelled)
+            tick=m.tick, energy=robot.energy_used, tau=tau / sharers, e=e,
+            dist_at_bid=robot.distance_travelled, sharers=sharers)
         self.bump(robot.robot_id, "assign")
+        share_txt = "" if sharers == 1 else \
+            f" | shared {sharers}-way, solo tau was {tau:.1f}"
         self.log("ASSIGN",
                  f"takes T{task_id} at {task.cell} (V={task.remaining:.2f}) "
                  f"p*={robot.work_cell} q*={robot.dump_cell} "
-                 f"| bid tau={tau:.1f} E={e:.2f} | path={len(robot._path)} steps",
+                 f"| bid tau={tau / sharers:.1f} E={e:.2f} "
+                 f"| path={len(robot._path)} steps{share_txt}",
                  INFO, robot.robot_id, task_id)
 
     def _on_finish(self, robot, task_id: int | None) -> None:
@@ -570,6 +620,10 @@ class DebugMonitor:
         if sig != self._progress_sig:
             self._progress_sig = sig
             self.last_progress_tick = m.tick
+
+        if m.tick % self.churn_window == 0:
+            self._abandon_mark = {r.robot_id: self.count(r.robot_id, "abandon")
+                                  for r in m.robots}
 
         if not (any(r.task_id is None for r in m.robots) and m.tasks.pending):
             self._idle_streak = 0
@@ -855,7 +909,6 @@ def main(argv=None) -> int:            # pragma: no cover - CLI
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--robots", type=int, default=4)
     p.add_argument("--tasks", type=int, default=8)
-    p.add_argument("--max-sharers", type=int, default=4)
     p.add_argument("--hazard-rate", type=float, default=0.0)
     p.add_argument("--obstacle-rate", type=float, default=0.0)
     p.add_argument("--every", type=int, default=10,
@@ -866,7 +919,6 @@ def main(argv=None) -> int:            # pragma: no cover - CLI
 
     model = ExcavationModel(seed=args.seed, allocator=args.allocator,
                             n_robots=args.robots, n_tasks=args.tasks,
-                            max_sharers=args.max_sharers,
                             hazard_rate=args.hazard_rate,
                             obstacle_rate=args.obstacle_rate)
     mon = attach(model)

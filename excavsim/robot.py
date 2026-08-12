@@ -30,6 +30,7 @@ from mesa.discrete_space import CellAgent
 from .allocation import CBBAAgent
 from .bidding import Stage
 from .CBPAE import CBPAEAgent
+from .MOACBBA import MOACBBAAgent
 from .costs import RobotSpec
 from .pathfinding import astar, chebyshev, nearest_work_cell
 from .terrain import ALPHA, BETA, DIGGABLE, HARDNESS, Terrain, FULL_PAYLOAD_GAMMA, GAMMA
@@ -83,6 +84,7 @@ class ExcavatorRobot(CellAgent):
         # Decentralised allocators: each robot runs its own copy.
         self.CBBA = CBBAAgent()
         self.CBPAE = CBPAEAgent()
+        self.MOACBBA = MOACBBAAgent()
 
         # Max number of tasks in a CBBA bundle (L_t in Choi et al.).
         # RENAMED from `capacity`, which collided with spec.capacity
@@ -117,15 +119,25 @@ class ExcavatorRobot(CellAgent):
         two sharers pick the same p*, collide, and burn STUCK_LIMIT
         ticks each before _reroute untangles them."""
         task = self.model.tasks.get(task_id)
-        if task.done or task.assigned_to is not None:
+        if task.done or self.robot_id in task.assignees:
             return False
+        # Seat limits are allocator policy (MOA-CBBA decides how many
+        # robots a task is worth); the robot only enforces physics --
+        # it cannot stand where a co-worker is already standing.
+        shared = bool(task.assignees)
         claimed = self.model.claimed_work_cells(exclude=self)
         found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                   self.model.grid.width,
                                   self.model.grid.height,
                                   self.model.blocked_cells(),
                                   claimed)
-        if found is None:   # fall back to an uncontended search rather
+        if found is None:
+            if shared:
+                # The uncontended fallback ignores claimed cells, which is
+                # harmless when nobody else is on this task and a
+                # guaranteed collision when somebody is: both robots would
+                # pick the same p* and burn STUCK_LIMIT ticks each.
+                return False
             found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                       self.model.grid.width,
                                       self.model.grid.height,
@@ -143,7 +155,7 @@ class ExcavatorRobot(CellAgent):
         self.work_cell = work_cell
         self.dump_cell = dump[0]
         self.task_id = task_id
-        task.assigned_to = self.robot_id
+        task.add_assignee(self.robot_id)
         self._waiting = 0
         self.stage = Stage.TO_TASK
         self._plan_leg(self.work_cell)
@@ -172,7 +184,7 @@ class ExcavatorRobot(CellAgent):
         if self.task_id is None:
             return
         task = self.model.tasks.get(self.task_id)
-        task.assigned_to = None
+        task.drop_assignee(self.robot_id)
         self.tasks_dropped += 1
         self.task_id = None
         self.work_cell = None
@@ -374,16 +386,23 @@ class ExcavatorRobot(CellAgent):
             self._plan_leg(self.work_cell)   # return to the same p*
 
     def _finish_task(self) -> None:
-        """The chunk's volume reached zero. ONLY that."""
+        """The task's volume reached zero. ONLY that.
+
+        With concurrent sharing the robot leaving is not the same event
+        as the task finishing: k robots each call this, and each drops
+        only ITS OWN seat. completed_tick is stamped once, by whoever
+        gets here first, and never overwritten -- makespan wants when the
+        soil ran out, not when the last co-worker happened to notice."""
         task = self.model.tasks.get(self.task_id)
         if not task.done:
             # Safety net for any future call site that gets this wrong:
-            # a completion stamp on a chunk with volume left is a lie the
+            # a completion stamp on a task with volume left is a lie the
             # makespan cannot detect.
             self._release_task()
             return
-        task.completed_tick = self.model.tick
-        task.assigned_to = None
+        if task.completed_tick is None:
+            task.completed_tick = self.model.tick
+        task.drop_assignee(self.robot_id)
         self.tasks_completed += 1
         self.task_id = None
         self.work_cell = None

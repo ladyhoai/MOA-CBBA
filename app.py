@@ -172,16 +172,15 @@ def task_frame(model) -> pd.DataFrame:
             status = f"done @ {t.completed_tick}"
         elif t.done:
             status = f"finishing (robot {t.assigned_to})"
-        elif t.assigned_to is not None:
-            status = f"robot {t.assigned_to}"
+        elif t.assignees:
+            status = f"{t.sharers} robot(s)"
         else:
             status = "pending"
         rows.append({
             "task": f"T{t.task_id}",
-            "site": f"S{t.site_id}",
             "cell": str(t.cell),
             "remaining": f"{t.remaining:.2f}/{t.volume:.2f}",
-            "sharers": model.tasks.sharers(t.site_id),
+            "seats": ",".join(f"R{i}" for i in sorted(t.assignees)) or "—",
             "status": status,
         })
     return pd.DataFrame(rows)
@@ -226,19 +225,6 @@ def CellInspector(model):
         ("soil volume", f"{soil:.2f}"),
         ("traversable", "no" if blocked else "yes"),
     ]
-
-    here = model.tasks.at_cell(c)
-    if here:
-        site = here[0].site_id
-        who = [f"R{t.assigned_to}" for t in here
-               if t.assigned_to is not None]
-        rows += [
-            ("site", f"S{site}  ({len(here)} chunk"
-                     f"{'s' if len(here) > 1 else ''})"),
-            ("site remaining",
-             f"{model.tasks.site_remaining(site):.2f} / {here[0].site_volume:.2f}"),
-            ("sharing robots", ", ".join(who) if who else "—"),
-        ]
 
     task = next((t for t in model.tasks.all if t.cell == c), None)
     if task is not None:
@@ -307,14 +293,13 @@ def SidePanel(model):
                                    on_value=pick, dense=True)
 
         done = sum(t.done for t in model.tasks.all)
-        sites_done = sum(model.tasks.site_done(s) for s in model.tasks.sites)
         soil = sum(t.volume - t.remaining for t in model.tasks.all)
         energy = sum(r.energy_used for r in model.robots)
         idle = (sum(r.idle_ticks for r in model.robots)
                 / max(1, model.tick * len(model.robots)))
         solara.Markdown(
-            f"**tick** {model.tick} &nbsp;|&nbsp; **sites** {sites_done}/{model.tasks.n_sites} "
-            f"&nbsp;|&nbsp; **chunks** {done}/{len(model.tasks.all)} "
+            f"**tick** {model.tick} "
+            f"&nbsp;|&nbsp; **tasks** {done}/{len(model.tasks.all)} "
             f"&nbsp;|&nbsp; **soil** {soil:.2f} &nbsp;|&nbsp; **energy** {energy:.2f} "
             f"&nbsp;|&nbsp; **idle** {idle:.3f} &nbsp;|&nbsp; **J(x)** {model.current_objective():.1f}")
 
@@ -482,7 +467,7 @@ def DebugPanel(model):
 # Assembly
 # ------------------------------------------------------------------ #
 model_instance = ExcavationModel(
-    seed=42, allocator="greedy", max_sharers=4,
+    seed=99, allocator="moa-cbba",
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
     hazard_rate=0.05, hazard_size=2, hazard_duration=5,
@@ -712,7 +697,6 @@ model_params = {
     "seed": {"type": "InputText", "value": 42, "label": "random seed"},
     "n_robots": Slider("robots", 4, 1, 12, 1),
     "n_tasks": Slider("sites", 8, 1, 30, 1),
-    "max_sharers": Slider("max robots per site (1 = off)", 1, 1, 4, 1),
     "rock_fraction": Slider("rock fraction", 0.15, 0.0, 0.5, 0.05),
     "gravel_fraction": Slider("gravel fraction", 0.20, 0.0, 0.5, 0.05),
     "allocator": {

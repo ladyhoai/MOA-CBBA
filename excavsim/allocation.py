@@ -39,8 +39,8 @@ from pathlib import Path
 
 from .bidding import (EPS, INF, NOBID, Stage, _better_bid, bid_value,
                       leg_cost)
+from .comms import network_diameter
 from .CBPAE import CBPAEAllocator
-from .MOACBBA import MOACBBAAllocator
 
 # A task under execution cannot be taken away mid-dig, so its owner
 # advertises an unbeatable (but finite -- inf poisons the arithmetic)
@@ -110,31 +110,6 @@ def _check_consistency(tag, bundle, path, where):
     return ok
 
 
-def network_diameter(model) -> int:
-    """D in Choi et al. Eq. (19): longest shortest path in the comm
-    graph. Unlimited range is a complete graph, so D = 1. A disconnected
-    graph has no finite diameter; fall back to the fleet size, which is
-    the loosest bound that still terminates."""
-    robots = model.robots
-    n = len(robots)
-    if n <= 1 or model.comms.comm_range is None:
-        return 1
-    adj = {r.robot_id: [b.robot_id for b in model.comms.neighbors(r)]
-           for r in robots}
-    best = 1
-    for src in adj:
-        seen = {src: 0}
-        q = deque([src])
-        while q:
-            u = q.popleft()
-            for v in adj[u]:
-                if v not in seen:
-                    seen[v] = seen[u] + 1
-                    q.append(v)
-        if len(seen) < n:
-            return n
-        best = max(best, max(seen.values()))
-    return max(1, best)
 
 
 #########################
@@ -405,6 +380,12 @@ class CBBAAgent:
             self.winningBidList[task_id] = NOBID
             self.winningAgentList[task_id] = None
 
+    def _pathScore(self, model, robot, path) -> float:
+        """Seam for subclasses. Algorithm 3 below calls this rather than
+        pathScoreCBBA directly, so a variant can change what a path is
+        WORTH without reimplementing how bundles are built."""
+        return pathScoreCBBA(model, robot, path)
+
     def _clamped_gain(self, task_id: int, raw: float) -> float:
         """Lemma 4: c_ij(t) = min(c_ij_raw(t), c_ij(t-1)).
 
@@ -446,7 +427,7 @@ class CBBAAgent:
                 _dbg(1, f"{tag} STOP: no tasks left outside the bundle")
                 break
 
-            currentPathScore = pathScoreCBBA(model, robot, self.path)
+            currentPathScore = self._pathScore(model, robot, self.path)
 
             _dbg(1, "-" * 78)
             _dbg(1, f"{tag} iter {iteration} | bundle={self.bundle} "
@@ -463,7 +444,7 @@ class CBBAAgent:
                     trialPath = (self.path[:trialPosition]
                                  + [cand.task_id]
                                  + self.path[trialPosition:])
-                    trialBid = pathScoreCBBA(model, robot, trialPath)
+                    trialBid = self._pathScore(model, robot, trialPath)
                     if bestTaskLocation is None or trialBid > bestBidTask:
                         bestBidTask = trialBid
                         bestTaskLocation = trialPosition
@@ -607,6 +588,12 @@ class CBBAAllocator(Allocator):
 
     name = "cbba"
     ROUND_CEILING = 200      # hard stop; the real bound is N_min * D
+    # Which per-robot agent instance this allocator drives. Subclasses
+    # point at their own attribute so two allocators never share state.
+    AGENT_ATTR = "CBBA"
+
+    def _agent(self, robot):
+        return getattr(robot, self.AGENT_ATTR)
 
     def __init__(self) -> None:
         self.last_round = 0
@@ -641,21 +628,27 @@ class CBBAAllocator(Allocator):
             return
 
         for r in robots:
-            r.CBBA.prune(model, r)
+            agent = self._agent(r)
+            agent.prune(model, r)
             # A robot may bid on any unfinished task that nobody else is
             # executing; its own current task stays visible so it keeps
             # winning it.
-            r.CBBA.task_list = [
+            agent.task_list = [
                 t for t in open_tasks
                 if t.assigned_to is None or t.assigned_to == r.robot_id]
-            r.CBBA._score_memo = {}
+            agent._score_memo = {}
             r.receive_all()          # drop anything stale in the inbox
 
         # Theorem 1: convergence within N_min * D iterations.
         L_t = max(r.bundle_limit for r in robots)
         n_min = min(len(open_tasks), len(robots) * L_t)
+        # Floor of 2: convergence is DEFINED as a round in which nothing
+        # changed, so a ceiling of 1 can never report it. Late in a run
+        # n_min collapses to 1 (one open chunk), max_rounds became 1, and
+        # every auction logged "did NOT converge" -- which also defeats
+        # _trigger, since it only short-circuits on a converged result.
         max_rounds = min(self.ROUND_CEILING,
-                         max(1, n_min * network_diameter(model)))
+                         max(2, n_min * network_diameter(model)))
 
         _dbg(1, f"\n[AUCTION @ tick {model.tick}] {len(robots)} robots, "
                 f"{len(open_tasks)} open tasks, max_rounds={max_rounds}")
@@ -665,10 +658,12 @@ class CBBAAllocator(Allocator):
         for rnd in range(1, max_rounds + 1):
             self._clock += 1
             for robot in robots:
-                robot.CBBA.createBundle(model, robot)
-                robot.CBBA.broadcast(robot, self._clock)
+                agent = self._agent(robot)
+                agent.createBundle(model, robot)
+                agent.broadcast(robot, self._clock)
             model.comms.flush_and_deliver(model.tick)
-            changed = [r.CBBA.resolveConflicts(r, r.receive_all(), self._clock)
+            changed = [self._agent(r).resolveConflicts(
+                           r, r.receive_all(), self._clock)
                        for r in robots]
             self.last_round = rnd
             if not any(changed):
@@ -684,24 +679,31 @@ class CBBAAllocator(Allocator):
         for robot in robots:
             if robot.task_id is not None:
                 continue
-            for task_id in list(robot.CBBA.path):
-                if robot.CBBA._winner(task_id) != robot.robot_id:
+            agent = self._agent(robot)
+            for task_id in list(agent.path):
+                if agent._winner(task_id) != robot.robot_id:
                     continue
                 if robot.assign(task_id):
                     _dbg(1, f"[AUCTION]   R{robot.robot_id} starts {task_id}, "
-                            f"bundle={robot.CBBA.bundle}")
+                            f"bundle={agent.bundle}")
                     break
                 # assign() refused: no reachable dig cell, or no dump
                 # reachable from it. Dropping it from bundle/path while
                 # LEAVING z pointing at this robot advertised a claim it
                 # had already given up, and y_ij then blocked every other
                 # robot from bidding on it.
-                robot.CBBA.path.remove(task_id)
-                if task_id in robot.CBBA.bundle:
-                    robot.CBBA.bundle.remove(task_id)
-                robot.CBBA.winningBidList[task_id] = NOBID
-                robot.CBBA.winningAgentList[task_id] = None
+                agent.path.remove(task_id)
+                if task_id in agent.bundle:
+                    agent.bundle.remove(task_id)
+                agent.winningBidList[task_id] = NOBID
+                agent.winningAgentList[task_id] = None
 
 
+# MOACBBAAllocator registers ITSELF into this dict on import (see the
+# bottom of MOACBBA.py). It subclasses CBBAAgent/CBBAAllocator, so this
+# module cannot import it at the top, and a bottom-of-file import would
+# fail whenever MOACBBA happened to be imported first. robot.py imports
+# MOACBBAAgent, so the registration always happens before any model is
+# built.
 ALLOCATORS = {a.name: a for a in (GreedyAllocator, CBBAAllocator,
-                                  CBPAEAllocator, MOACBBAAllocator)}
+                                  CBPAEAllocator)}

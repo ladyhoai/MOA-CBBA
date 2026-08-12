@@ -18,12 +18,15 @@ from mesa.discrete_space import (FixedAgent, OrthogonalMooreGrid,
                                  PropertyLayer)
 from perlin_numpy import generate_fractal_noise_2d
 from .allocation import ALLOCATORS
+from .MOACBBA import register as _register_moacbba
+
+_register_moacbba()
 from .comms import CommNetwork
 from .costs import RobotSpec, objective
 from .fleet import ROBOT_CLASSES, build_fleet, fleet_summary
 from .pathfinding import nearest_work_cell, nearest_work_path, work_candidates
 from .robot import ExcavatorRobot
-from .tasks import MIN_CHUNK, TaskRegistry, chunk_count
+from .tasks import TaskRegistry
 from .terrain import T_UNLOAD, Terrain
 from .dynamics import Coord, DynamicsManager
 
@@ -33,26 +36,22 @@ DEFAULT_SPEC = ROBOT_CLASSES["medium"]
 
 
 class TaskMarker(FixedAgent):
-    """Passive agent standing on an excavation SITE so the GUI draws it
-    through the standard agent pipeline. Holds all chunks of that site
-    and removes itself only when every chunk is done -- one marker per
-    cell, not one per chunk, or k sharers would stack k markers on the
-    same square. No physics: it never moves, digs, or spends energy."""
+    """Passive agent standing on an excavation site so the GUI draws it
+    through the standard agent pipeline. No physics: it never moves,
+    digs, or spends energy."""
 
-    def __init__(self, model, cell, chunks):
+    def __init__(self, model, cell, task):
         super().__init__(model)
         self.cell = cell
-        self.chunks = list(chunks)
-        self.task = self.chunks[0]          # back-compat for old callers
-        self.site_id = self.chunks[0].site_id
+        self.task = task
 
     @property
     def remaining(self) -> float:
-        return sum(t.remaining for t in self.chunks)
+        return self.task.remaining
 
     @property
     def done(self) -> bool:
-        return all(t.done for t in self.chunks)
+        return self.task.done
 
     def step(self) -> None:
         if self.done:
@@ -71,10 +70,24 @@ class ExcavationModel(Model):
         w2: float = 1,
 
         # --- Phase 2 heterogeneity (Table 1, items 2.1-2.4) --------- #
-        fleet_mode: str = "capacity",   # "none" | "capacity" | "full"
+        # "full" by default: under "capacity" only the payload differs,
+        # so v_max, dig_rate and drain_scale are identical across the
+        # fleet and robots are near-interchangeable -- most allocations
+        # are then nearly as good as each other and no allocator can
+        # separate from another. "capacity" remains available as the
+        # Phase 2 ablation.
+        fleet_mode: str = "full",       # "none" | "capacity" | "full"
         fleet_mix: tuple[str, ...] | None = None,   # None -> small/medium/large
         fleet_shuffle: bool = False,    # False -> deterministic round-robin
-        comm_range: float | None = None,
+        # Finite by default. At None every robot hears every other every
+        # round, so CBBA's Table I has nothing to resolve: every log
+        # reports last_round=1, converged=True, and the s vector,
+        # mergeTimestamps and the whole third-agent half of the decision
+        # table are dead code the run still pays for. At ~10 on a 32x32
+        # grid the network is a genuine multi-hop mesh and consensus
+        # becomes the thing being compared. None restores the old
+        # complete-graph behaviour.
+        comm_range: float | None = 10.0,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
         comm_bandwidth: int | None = None,
@@ -94,15 +107,31 @@ class ExcavationModel(Model):
         rock_fraction: float = 0.15,
         gravel_fraction: float = 0.2,
 
+        # --- bedrock ridges (impassable) ---------------------------- #
+        # Terrain.BEDROCK, HARDNESS[BEDROCK] = inf and _static_blocked's
+        # np.where were all wired up and never exercised: _scatter_terrain
+        # only ever wrote ROCK and GRAVEL, so the map was an open plain
+        # and every robot could reach every task at roughly equal cost.
+        # Ridges (not noise) create regions, which is what makes WHICH
+        # robot gets WHICH task change the cost by a factor rather than a
+        # few percent. 0 ridges reproduces the open-plain behaviour.
+        bedrock_ridges: int = 6,
+        bedrock_length: int = 10,
+
         elevation_scale: float = 15.0,
         elevation_octaves: int = 4,  # How detailed
         elevation_persistence: float = 0.5,
 
-        task_volume: tuple[float, float] = (1.0, 4.0),
+        # Log-uniform over a wider range. Uniform(1, 4) plus chunking
+        # produced NO critical path: chunk_count splits by
+        # volume // MIN_CHUNK, so the biggest sites yielded the SMALLEST
+        # chunks and every chunk ended up between 1.0 and ~2.0. Makespan
+        # was then total-work / n_robots regardless of who did what, and
+        # no makespan-aware allocator could beat any other. Durations
+        # need to differ by 5-10x for the allocation to matter.
+        task_volume: tuple[float, float] = (1.0, 12.0),
+        volume_dist: str = "loguniform",   # or "uniform" for the old runs
 
-        # --- task decomposition (multi-robot cooperation per cell) --- #
-        max_sharers: int = 4,       # 1 = off, reproduces the old behaviour
-        min_chunk: float = MIN_CHUNK,
         seed: int | None = None,
     ):
         super().__init__(rng=int(seed) if seed is not None else None)
@@ -134,6 +163,7 @@ class ExcavationModel(Model):
             PropertyLayer("elevation", (width, height),
                           default_value=0.0, dtype=float))
         self._scatter_terrain(rock_fraction, gravel_fraction)
+        self._scatter_bedrock(bedrock_ridges, bedrock_length)
         self._scatter_elevation(elevation_octaves, elevation_persistence, elevation_scale)
 
         # --- dump sites: 2x2 impassable blocks --------------------------- #
@@ -154,16 +184,14 @@ class ExcavationModel(Model):
 
         # --- tasks ------------------------------------------------------ #
         self.tasks = TaskRegistry()
-        self.max_sharers = int(max_sharers)
-        self.min_chunk = float(min_chunk)
         lo, hi = task_volume
         for _ in range(n_tasks):
             cell = self._random_diggable_coord()
-            vol = self.random.uniform(lo, hi)
+            vol = (self.random.uniform(lo, hi) if volume_dist == "uniform"
+                   else lo * (hi / lo) ** self.random.random())
             self.grid.soil_volume.data[cell] += vol
-            k = self._chunk_count(cell, vol)
-            chunks = self.tasks.add(cell, vol, n_chunks=k)
-            TaskMarker(self, self.grid[cell], chunks)
+            task = self.tasks.add(cell, vol)
+            TaskMarker(self, self.grid[cell], task)
         # print(len(self.tasks.all), "tasks placed")
         # --- robots (Phase 2: one spec per robot, not one for all) ------ #
         self.fleet_mode = fleet_mode
@@ -251,8 +279,18 @@ class ExcavationModel(Model):
         self._leg_cache = {}                       # fresh per tick
         self.allocator.allocate(self)              # bidding + consensus
         self.agents.shuffle_do("step")             # execute (random order)
+        # Every bundle-based agent a robot happens to carry, so the figure
+        # is not silently 0 on a moa-cbba run and misread as "this is
+        # CBAA". getattr, not attribute access: this metric runs on every
+        # tick of every run regardless of the allocator in use, so a
+        # robot built without one of these agents must not take the whole
+        # simulation down for the sake of a logging number.
         self._max_bundle_seen = max(
-            [self._max_bundle_seen] + [len(r.CBBA.bundle) for r in self.robots])
+            [self._max_bundle_seen]
+            + [len(getattr(r, attr).bundle)
+               for r in self.robots
+               for attr in ("CBBA", "MOACBBA")
+               if getattr(r, attr, None) is not None])
         self.changed_cells.clear()
         self.datacollector.collect(self)
 
@@ -375,6 +413,56 @@ class ExcavationModel(Model):
                 elif u < rock_frac + gravel_frac:
                     self.grid.terrain.data[x, y] = int(Terrain.GRAVEL)
 
+    def _scatter_bedrock(self, n_ridges: int, length: int) -> None:
+        """Impassable ridges, added one at a time and rolled back if they
+        would cut the map in two.
+
+        A disconnected map is not a harder instance, it is a broken one:
+        tasks behind a wall are unreachable, robots stall forever and the
+        run never terminates. Each ridge is therefore committed only if
+        every free cell is still reachable from every other.
+        """
+        if n_ridges <= 0 or length <= 0:
+            return
+        w, h = self.grid.width, self.grid.height
+        for _ in range(n_ridges):
+            x, y = self.random.randrange(w), self.random.randrange(h)
+            dx, dy = self.random.choice([(1, 0), (0, 1), (1, 1), (1, -1)])
+            placed = []
+            for _ in range(length):
+                if not (0 <= x < w and 0 <= y < h):
+                    break
+                if self.grid.terrain.data[x, y] != int(Terrain.BEDROCK):
+                    placed.append((x, y))
+                    self.grid.terrain.data[x, y] = int(Terrain.BEDROCK)
+                x, y = x + dx, y + dy
+            if placed and not self._free_space_connected():
+                for cx, cy in placed:       # roll the whole ridge back
+                    self.grid.terrain.data[cx, cy] = int(Terrain.SOIL)
+
+    def _free_space_connected(self) -> bool:
+        """Flood fill over non-bedrock cells; True if they are one
+        component. Dump blocks are placed later and are only 2x2, so
+        bedrock is the only thing that can realistically sever the map."""
+        w, h = self.grid.width, self.grid.height
+        rock = int(Terrain.BEDROCK)
+        free = [(x, y) for x in range(w) for y in range(h)
+                if self.grid.terrain.data[x, y] != rock]
+        if not free:
+            return False
+        seen = {free[0]}
+        stack = [free[0]]
+        while stack:
+            cx, cy = stack.pop()
+            for ddx in (-1, 0, 1):
+                for ddy in (-1, 0, 1):
+                    n = (cx + ddx, cy + ddy)
+                    if (0 <= n[0] < w and 0 <= n[1] < h and n not in seen
+                            and self.grid.terrain.data[n[0], n[1]] != rock):
+                        seen.add(n)
+                        stack.append(n)
+        return len(seen) == len(free)
+
     def _scatter_elevation(self, octaves: int, persistence: float, height_scale: float) -> None:
         if height_scale <= 0.0:
             return
@@ -396,15 +484,6 @@ class ExcavationModel(Model):
         
         self.grid.elevation.data[:, :] = height_scale * field
 
-
-    def _chunk_count(self, cell: Coord, volume: float) -> int:
-        """Split factor for one site. Uses only STATIC blocking, since
-        hazards and obstacles are transient and the split is fixed at
-        creation time -- a chunk count that changed with the weather
-        would keep invalidating the BAM."""
-        free = len(work_candidates([cell], self.grid.width, self.grid.height,
-                                   self._static_blocked()))
-        return chunk_count(volume, self.max_sharers, free, self.min_chunk)
 
     def claimed_work_cells(self, exclude=None) -> set[Coord]:
         """Work cells other robots have already committed to. Passed to

@@ -149,3 +149,38 @@ class CommNetwork:
         ax, ay = a.cell.coordinate
         bx, by = b.cell.coordinate
         return math.hypot(ax - bx, ay - by) <= self.comm_range
+
+# --------------------------------------------------------------------- #
+# Graph property of the comm network. Lives HERE, not in allocation.py:
+# it needs only model.robots and model.comms, and keeping it in the
+# allocator module forced MOACBBA.py -- which subclasses nothing from
+# allocation but needs this bound -- to import allocation at module
+# scope, which closed an import cycle
+#   allocation -> MOACBBA -> allocation
+# that only manifested when allocation was imported first.
+# --------------------------------------------------------------------- #
+def network_diameter(model) -> int:
+    """D in Choi et al. Eq. (19): longest shortest path in the comm
+    graph. Unlimited range is a complete graph, so D = 1. A disconnected
+    graph has no finite diameter; fall back to the fleet size, which is
+    the loosest bound that still terminates."""
+    robots = model.robots
+    n = len(robots)
+    if n <= 1 or model.comms.comm_range is None:
+        return 1
+    adj = {r.robot_id: [b.robot_id for b in model.comms.neighbors(r)]
+           for r in robots}
+    best = 1
+    for src in adj:
+        seen = {src: 0}
+        q = deque([src])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in seen:
+                    seen[v] = seen[u] + 1
+                    q.append(v)
+        if len(seen) < n:
+            return n
+        best = max(best, max(seen.values()))
+    return max(1, best)
