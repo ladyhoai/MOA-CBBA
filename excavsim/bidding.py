@@ -41,9 +41,18 @@ class Stage(Enum):
 # ------------------------------------------------------------------ #
 # leg costs
 # ------------------------------------------------------------------ #
-def leg_cost(model, robot, task, startPos=None) -> tuple[float, float, object]:
+def leg_cost(model, robot, task, startPos=None,
+             volume=None) -> tuple[float, float, object]:
     """(tau_ij, E_ij, q*) for robot i taking task j, starting from
     `startPos` (its current cell if None).
+
+    `volume` overrides task.remaining, which is what lets an allocator
+    price a SHARE of a task. Scaling the returned totals afterwards is
+    not equivalent and gets the answer wrong in two ways: the approach
+    leg (d_task / v_max, ALPHA * d_task) is paid in full no matter how
+    little the robot digs, and n_ij = ceil(V/C) is a step function, so a
+    robot digging half the pile may make three trips rather than half of
+    six. Passing the share in gets both right for free.
 
     Returns (inf, inf, None) when the task or a dump site is unreachable.
     """
@@ -58,8 +67,10 @@ def leg_cost(model, robot, task, startPos=None) -> tuple[float, float, object]:
     # once per candidate insertion position, so an auction round over n
     # tasks costs O(n^3) A* searches without this. Cleared every tick by
     # model.step(); robots never move inside a round.
+    vol = task.remaining if volume is None else max(0.0, float(volume))
+
     cache = getattr(model, "_leg_cache", None)
-    key = (robot.robot_id, task.task_id, start, round(task.remaining, 9))
+    key = (robot.robot_id, task.task_id, start, round(vol, 9))
     if cache is not None and key in cache:
         return cache[key]
 
@@ -81,8 +92,8 @@ def leg_cost(model, robot, task, startPos=None) -> tuple[float, float, object]:
     elev = model.grid.elevation.data
     traction = model.dynamics.traction_scale()
 
-    t = tau_ij(robot.spec, task.remaining, h, d_task, d_dump)
-    e = energy_ij(robot.spec, task.remaining, h, d_task, d_dump,
+    t = tau_ij(robot.spec, vol, h, d_task, d_dump)
+    e = energy_ij(robot.spec, vol, h, d_task, d_dump,
                   climb_to_task=path_climb(path_task, elev),
                   climb_to_dump=path_climb(path_dump, elev),
                   climb_from_dump=path_climb(path_dump[::-1], elev),

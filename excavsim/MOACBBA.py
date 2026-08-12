@@ -129,17 +129,23 @@ class MOACBBAAgent:
         """(completion time, energy) for executing `path` in order.
 
         SHARING CORRECTION. leg_cost prices task.remaining as if this
-        robot digs the whole thing alone. With k robots seated the volume
-        drains ~k times faster, so the true time is a fraction of that --
-        measured at x0.22 of bid on a 3-way shared task, i.e. the bid was
-        four times the truth. An allocator ranking candidates on a cost
-        model that wrong is not choosing what it thinks it is choosing.
+        robot digs the whole thing alone. With k robots seated each digs
+        roughly V/k, so the share is passed INTO leg_cost rather than
+        divided out of its result.
 
-        Only the TIME term is divided. Energy is not: three robots each
-        moving their share of the soil spend roughly the same total
-        energy as one robot moving all of it, and each individual robot
-        still pays for its own travel to and from the dump. Dividing
-        energy too would have made shared tasks look free.
+        The earlier version divided the returned tau by k and left the
+        energy alone, on the reasoning that k robots moving a third of
+        the soil each spend what one robot spends moving all of it. That
+        is true of the FLEET and false of each ROBOT, which is what a bid
+        prices: energy_ij's dig term is BETA*V*H/rho and its haul term
+        carries n = ceil(V/C), both proportional to the volume THIS robot
+        moves. The measured consequence was every shared task coming in
+        at x0.2-x0.6 of its energy bid, i.e. w2 silently inflated on
+        exactly the tasks this allocator is built around.
+
+        Dividing the totals would have been wrong too: the approach leg
+        is paid in full however little is dug, and n = ceil(V/C) is a
+        step function. Scaling the volume gets both right.
         """
         tau0, e0 = residual_cost(model, robot)
         t, e = float(tau0), float(e0)
@@ -148,12 +154,13 @@ class MOACBBAAgent:
             if task_id == robot.task_id:
                 continue
             task = model.tasks.get(task_id)
-            tau, en, dump = leg_cost(model, robot, task, startPos)
+            k = 1 if sharers_fn is None else max(1, sharers_fn(task))
+            tau, en, dump = leg_cost(model, robot, task, startPos,
+                                     volume=task.remaining / k)
             if dump is None:
                 return INF, INF
-            k = 1 if sharers_fn is None else max(1, sharers_fn(task))
-            t += tau / k
             e += en
+            t += tau
             startPos = dump
         return t, e
 
@@ -412,10 +419,12 @@ class MOACBBAAllocator:
                     return min(n, seats_fn(task))
 
                 cur_task = model.tasks.get(robot.task_id)
-                cur_tau, cur_e, cur_q = leg_cost(model, robot, cur_task)
-                current = (INF if cur_q is None else
-                           (model.w1 * cur_tau / max(1, expected(cur_task))
-                            + model.w2 * cur_e))
+                cur_k = max(1, expected(cur_task))
+                cur_tau, cur_e, cur_q = leg_cost(
+                    model, robot, cur_task,
+                    volume=cur_task.remaining / cur_k)
+                current = (INF if cur_q is None
+                           else model.w1 * cur_tau + model.w2 * cur_e)
                 better = None
                 for j in agent.path:
                     if j == robot.task_id:
@@ -425,11 +434,12 @@ class MOACBBAAllocator:
                         continue
                     if len(task.assignees) >= seats_fn(task):
                         continue            # no seat actually free
-                    tau, en, q = leg_cost(model, robot, task)
+                    k = max(1, expected(task))
+                    tau, en, q = leg_cost(model, robot, task,
+                                          volume=task.remaining / k)
                     if q is None:
                         continue
-                    cost = (model.w1 * tau / max(1, expected(task))
-                            + model.w2 * en)
+                    cost = model.w1 * tau + model.w2 * en
                     if cost < current * (1.0 - self.switch_margin) \
                             and (better is None or cost < better[0]):
                         better = (cost, j)

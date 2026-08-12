@@ -403,6 +403,19 @@ class DebugMonitor:
                             f"it is cycling, not re-allocating, and is "
                             f"unlikely to finish anything"))
 
+        # 11d. Soil in a hopper is soil that has not been delivered. If
+        #      every task is stamped while a robot is still carrying, the
+        #      run is about to declare victory with material in transit.
+        if m.tasks.all_done:
+            carrying = [(r.robot_id, r.payload) for r in m.robots
+                        if r.payload > 1e-9]
+            if carrying:
+                add((ERROR, "every task is stamped complete but "
+                            + ", ".join(f"R{i} still carries {p:.2f}"
+                                        for i, p in carrying)
+                            + " — that soil never reached a dump and the "
+                              "makespan is short by the final haul"))
+
         # 12. finished-but-unstamped AND unowned. A chunk that is empty
         #     but still owned is normal: the digger is hauling the last
         #     load and stamps completed_tick when it unloads. With no
@@ -529,22 +542,26 @@ class DebugMonitor:
         except Exception:                       # pragma: no cover
             self._note_error()
         # leg_cost prices the whole remaining volume as a solo job. When
-        # k robots share the task the volume drains ~k times faster, so
-        # comparing that bid against the realised time reported x0.22 --
-        # a four-fold "error" that was really just the accounting
-        # ignoring the co-workers. Recorded so the ratio measures cost
-        # model vs simulation, not solo-pricing vs shared execution.
+        # k robots share the task each moves roughly V/k, so the bid is
+        # re-priced on that share -- otherwise the ratio measures
+        # solo-pricing against shared execution rather than cost model
+        # against simulation, which is what it is supposed to test.
         sharers = max(1, len(task.assignees))
+        if sharers > 1:
+            try:
+                tau, e, _q2 = leg_cost(m, robot, task,
+                                       volume=task.remaining / sharers)
+            except Exception:                   # pragma: no cover
+                self._note_error()
         self.predictions[(robot.robot_id, task_id)] = _Prediction(
-            tick=m.tick, energy=robot.energy_used, tau=tau / sharers, e=e,
+            tick=m.tick, energy=robot.energy_used, tau=tau, e=e,
             dist_at_bid=robot.distance_travelled, sharers=sharers)
         self.bump(robot.robot_id, "assign")
-        share_txt = "" if sharers == 1 else \
-            f" | shared {sharers}-way, solo tau was {tau:.1f}"
+        share_txt = "" if sharers == 1 else f" | shared {sharers}-way"
         self.log("ASSIGN",
                  f"takes T{task_id} at {task.cell} (V={task.remaining:.2f}) "
                  f"p*={robot.work_cell} q*={robot.dump_cell} "
-                 f"| bid tau={tau / sharers:.1f} E={e:.2f} "
+                 f"| bid tau={tau:.1f} E={e:.2f} "
                  f"| path={len(robot._path)} steps{share_txt}",
                  INFO, robot.robot_id, task_id)
 

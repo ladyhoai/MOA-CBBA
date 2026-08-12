@@ -185,6 +185,10 @@ class ExcavatorRobot(CellAgent):
             return
         task = self.model.tasks.get(self.task_id)
         task.drop_assignee(self.robot_id)
+        # A robot can leave an ALREADY-EMPTY task through this path (no
+        # reachable dump). If it was the last seat, nothing else will
+        # ever stamp the task and all_done stays false forever.
+        self._stamp_if_complete(task)
         self.tasks_dropped += 1
         self.task_id = None
         self.work_cell = None
@@ -385,14 +389,32 @@ class ExcavatorRobot(CellAgent):
             self.stage = Stage.TO_TASK
             self._plan_leg(self.work_cell)   # return to the same p*
 
-    def _finish_task(self) -> None:
-        """The task's volume reached zero. ONLY that.
+    def _stamp_if_complete(self, task) -> None:
+        """A task is finished when the soil is IN THE DUMP, not when the
+        hole is empty.
 
-        With concurrent sharing the robot leaving is not the same event
-        as the task finishing: k robots each call this, and each drops
-        only ITS OWN seat. completed_tick is stamped once, by whoever
-        gets here first, and never overwritten -- makespan wants when the
-        soil ran out, not when the last co-worker happened to notice."""
+        With sharing those are different moments. Robot A digs the last
+        of the volume and drives off with a full hopper; robot B, seated
+        on the same task with an empty hopper, sees task.done on its very
+        next DIG tick and used to stamp completed_tick immediately. That
+        made TaskRegistry.all_done true -- and model.step() stops on
+        all_done -- while A was still in TO_DUMP carrying soil that never
+        reached a dump site. The run reported every task complete with
+        material still in a hopper, and the makespan was short by the
+        whole final haul.
+
+        Stamping when the LAST seat empties fixes both: every sharer has
+        by then either unloaded or given the task up, so the volume is
+        genuinely delivered. Call this AFTER drop_assignee, from every
+        exit path, or a task whose last robot leaves through the
+        unreachable-dump route never gets stamped and the run never
+        terminates."""
+        if task.done and not task.assignees and task.completed_tick is None:
+            task.completed_tick = self.model.tick
+
+    def _finish_task(self) -> None:
+        """This robot is done with the task. The TASK is done only when
+        the last sharer says so -- see _stamp_if_complete."""
         task = self.model.tasks.get(self.task_id)
         if not task.done:
             # Safety net for any future call site that gets this wrong:
@@ -400,9 +422,8 @@ class ExcavatorRobot(CellAgent):
             # makespan cannot detect.
             self._release_task()
             return
-        if task.completed_tick is None:
-            task.completed_tick = self.model.tick
         task.drop_assignee(self.robot_id)
+        self._stamp_if_complete(task)
         self.tasks_completed += 1
         self.task_id = None
         self.work_cell = None

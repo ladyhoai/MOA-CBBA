@@ -701,9 +701,9 @@ model_params = {
     "gravel_fraction": Slider("gravel fraction", 0.20, 0.0, 0.5, 0.05),
     "allocator": {
         "type": "Select",
-        "value": "greedy",
+        "value": "moa-cbba",
         "values": ["greedy", "cbba", "cbpae", "moa-cbba"],
-        "label": "allocator (moa-cbba not implemented yet)",
+        "label": "allocator",
     },
     "fleet_mode": {
         "type": "Select",
