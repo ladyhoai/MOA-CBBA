@@ -467,7 +467,7 @@ def DebugPanel(model):
 # Assembly
 # ------------------------------------------------------------------ #
 model_instance = ExcavationModel(
-    seed=99, allocator="moa-cbba",
+    seed=1, allocator="cbpae",
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
     hazard_rate=0.05, hazard_size=2, hazard_duration=5,

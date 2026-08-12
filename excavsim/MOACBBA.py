@@ -82,6 +82,26 @@ MAX_SHARERS = 3            # 1 reproduces single-robot-per-task
 MIN_SHARE = 1.2            # volume a seat must be worth having
 CAPACITY_AFFINITY = 0.25   # 0.0 removes mechanism 3
 SWITCH_MARGIN = 0.20       # en-route switch must be this much cheaper
+
+# OFF BY DEFAULT ON MEASURED EVIDENCE. Paired 8-seed comparison, all
+# else identical: en-route switching was worse on 7 seeds, tied on 1 and
+# better on 0, mean makespan +15.0 ticks (215.6 vs 200.6) and mean energy
+# +4.6 (84.8 vs 80.2). It loses on BOTH objectives at once.
+#
+# The reason is that a switch throws away sunk approach travel twice
+# over: the switching robot discards the distance it already covered
+# toward its old task, and the seat it vacates then has to be refilled
+# by some robot starting from further away than it was. The lockout and
+# the hysteresis margin stop the pathological per-tick churn (which was
+# real -- twelve abandon/re-assign cycles on consecutive ticks) but they
+# cannot recover that sunk cost, because the bid compares REMAINING cost
+# from here and is blind to what has already been spent getting here.
+#
+# Kept, not deleted: it is a clean ablation axis, and it may well pay off
+# in a regime with more tasks per robot or heavier dynamics, where the
+# information a robot gains en route is worth more. Enable with
+# MOACBBAAllocator(enable_switching=True).
+ENABLE_SWITCHING = False
 ROUND_CEILING = 200
 
 
@@ -316,11 +336,13 @@ class MOACBBAAllocator:
     def __init__(self, max_sharers: int = MAX_SHARERS,
                  min_share: float = MIN_SHARE,
                  capacity_affinity: float = CAPACITY_AFFINITY,
-                 switch_margin: float = SWITCH_MARGIN) -> None:
+                 switch_margin: float = SWITCH_MARGIN,
+                 enable_switching: bool = ENABLE_SWITCHING) -> None:
         self.max_sharers = int(max_sharers)
         self.min_share = float(min_share)
         self.capacity_affinity = float(capacity_affinity)
         self.switch_margin = float(switch_margin)
+        self.enable_switching = bool(enable_switching)
         self.last_round = 0
         self.converged = False
         self._clock = 0
@@ -407,7 +429,8 @@ class MOACBBAAllocator:
             # Only in execution phase 1 with an empty hopper (Das et al.
             # Sec. 3.7.4), only for a materially cheaper alternative, and
             # only if this robot has not switched recently.
-            if (robot.task_id is not None and robot.can_abandon
+            if (self.enable_switching
+                    and robot.task_id is not None and robot.can_abandon
                     and model.tick - agent.switched_tick >= SWITCH_LOCKOUT):
                 # Both sides priced HERE, from the same position, on the
                 # same basis. Reading the stored bid for the current task
