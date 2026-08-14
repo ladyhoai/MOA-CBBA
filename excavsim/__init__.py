@@ -7,6 +7,7 @@ from .tasks import Task, TaskRegistry
 from .fleet import ROBOT_CLASSES, build_fleet, fleet_summary
 from .allocation import ALLOCATORS, CBBAAgent, CBBAAllocator, GreedyAllocator
 from .CBPAE import CBPAEAgent, CBPAEAllocator
+from .MOACBBA import MOACBBAAgent, MOACBBAAllocator
 
 __all__ = ["CommNetwork", "Message", "ExcavationModel", "ExcavatorRobot",
            "Task", "TaskRegistry", "Stage",
@@ -14,4 +15,5 @@ __all__ = ["CommNetwork", "Message", "ExcavationModel", "ExcavatorRobot",
            "leg_cost", "bid_value", "residual_cost",
            "ROBOT_CLASSES", "build_fleet", "fleet_summary",
            "ALLOCATORS", "GreedyAllocator", "CBBAAllocator", "CBBAAgent",
-           "CBPAEAllocator", "CBPAEAgent"]
+           "CBPAEAllocator", "CBPAEAgent",
+           "MOACBBAAllocator", "MOACBBAAgent"]

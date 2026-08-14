@@ -117,6 +117,7 @@ class DebugMonitor:
     _pending_finish: dict = field(default_factory=dict)
     _check_seen: dict = field(default_factory=dict)
     _abandon_mark: dict = field(default_factory=dict)
+    soil_total: float = -1.0        # ground + hoppers + delivered
     _attached_at: int = 0
     _errors: list = field(default_factory=list)     # monitor's own failures
     enabled: bool = True
@@ -411,6 +412,26 @@ class DebugMonitor:
                             f"times in the last {self.churn_window} ticks — "
                             f"it is cycling, not re-allocating, and is "
                             f"unlikely to finish anything"))
+
+        # 11c-2. MASS CONSERVATION. Soil only ever moves ground ->
+        #        hopper -> dump; none of those steps may lose any. A leak
+        #        is invisible in every other metric: the task still
+        #        finishes, the makespan still reads, and the energy total
+        #        is simply short by a haul that never happened. Found
+        #        once by accident (0.34-0.99 units per CBPAE run); this
+        #        makes it impossible to miss again.
+        in_ground = sum(t.remaining for t in m.tasks.all)
+        in_hoppers = sum(r.payload for r in m.robots)
+        delivered = sum(r.soil_delivered for r in m.robots)
+        total = in_ground + in_hoppers + delivered
+        if self.soil_total < 0.0:
+            self.soil_total = total
+        elif abs(total - self.soil_total) > 1e-6:
+            add((ERROR, f"soil is not conserved: {total:.4f} now vs "
+                        f"{self.soil_total:.4f} at start "
+                        f"(ground {in_ground:.2f}, hoppers {in_hoppers:.2f}, "
+                        f"dumped {delivered:.2f}) — volume is being "
+                        f"created or destroyed"))
 
         # 11d. Soil in a hopper is soil that has not been delivered. If
         #      every task is stamped while a robot is still carrying, the

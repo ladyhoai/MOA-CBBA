@@ -390,10 +390,20 @@ class CBPAEAgent:
         changed = False
 
         if "stopexecution" in actions:
-            if robot.task_id == j:
+            # Sec. 3.7.4: a robot may stop ONLY in the first phase of
+            # execution, so that the task state is unchanged and the task
+            # stays reallocatable. Table 7 was calling abandon_task()
+            # with no such check, so a robot in TO_DUMP with a full
+            # hopper would drop the task and keep the soil. Every other
+            # drop path in this file checks can_abandon; this one did
+            # not. If it cannot stop yet it keeps executing and Table 7
+            # will fire again next round, once it is empty.
+            if robot.task_id == j and robot.can_abandon:
                 robot.abandon_task()
                 self.prevExecTask, self.execTask = j, None
-            changed = True
+                changed = True
+            elif robot.task_id != j:
+                changed = True
 
         if "release" in actions:
             self.release(j, n, now)

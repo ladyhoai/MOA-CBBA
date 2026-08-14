@@ -87,6 +87,12 @@ class ExcavationModel(Model):
         # grid the network is a genuine multi-hop mesh and consensus
         # becomes the thing being compared. None restores the old
         # complete-graph behaviour.
+        # Phase 3 sensing. False = the old omniscient behaviour, where
+        # every robot sees every hazard the tick it appears. True makes a
+        # robot plan against what its OWN sensor has found, so sigma_i
+        # (a dead RobotSpec field until now) and the weather sensor_scale
+        # (computed and only ever displayed) both start doing work.
+        sensing_enabled: bool = True,
         comm_range: float | None = 10.0,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
@@ -136,6 +142,7 @@ class ExcavationModel(Model):
     ):
         super().__init__(rng=int(seed) if seed is not None else None)
         self.w1, self.w2 = w1, w2
+        self.sensing_enabled = bool(sensing_enabled)
         self.t_unload = T_UNLOAD
         self.tick = 0
         # Largest CBBA bundle any robot has held this run. Cheap, and
@@ -212,6 +219,11 @@ class ExcavationModel(Model):
         # --- Phase 6 communication layer (neutral by default) ----------- #
         # Change comm_range to a number so that the s vector is utilised
 
+        # The GUI slider cannot express None, so it sends 0 for
+        # "unlimited". Anything <= 0 would otherwise mean a robot can
+        # hear nobody at all, which silently disables consensus.
+        if comm_range is not None and comm_range <= 0:
+            comm_range = None
         self.comms = CommNetwork(self, comm_range=comm_range,
                                  packet_loss=packet_loss,
                                  latency=comm_latency,
@@ -276,6 +288,12 @@ class ExcavationModel(Model):
         self.dynamics.step(self.tick)
         self.comms.flush_and_deliver(self.tick)    # in-flight messages land
 
+        # Sense BEFORE bidding: a bid priced on a stale occupancy map is
+        # a bid the robot cannot execute, which breaks the
+        # bid == execution invariant the whole cost model rests on.
+        for r in self.robots:
+            r.sense()
+
         self._leg_cache = {}                       # fresh per tick
         self.allocator.allocate(self)              # bidding + consensus
         self.agents.shuffle_do("step")             # execute (random order)
@@ -328,29 +346,37 @@ class ExcavationModel(Model):
 
     #### COULD BE DEPRECATED BECAUSE DUMP_WORK_PATH EXISTS
     def dump_work_cell(self, coord: Coord,
-                       occupied: set[Coord] | None = None):
+                       occupied: set[Coord] | None = None,
+                       blocked: set[Coord] | None = None):
         """Nearest unload position: a traversable cell adjacent to any
         dump block, chosen deterministically. Returns (cell, dist) or
         None. Pass `occupied` to exclude/avoid other robots; omit it for
-        uncontended cost estimates (bids)."""
+        uncontended cost estimates (bids).
+
+        `blocked` lets a caller plan on ITS OWN map. Without it the haul
+        leg was planned omnisciently while the approach leg used the
+        robot's sensed map, so a robot was blind to hazards on the way to
+        the dig site but knew every hazard on the way to the dump -- and
+        the haul is the larger leg, walked n = ceil(V/C) times."""
         best = None
+        known = self.blocked_cells() if blocked is None else blocked
         for block in self.dump_blocks:
             found = nearest_work_cell(coord, block, self.grid.width,
-                                      self.grid.height,
-                                      self.blocked_cells(), occupied)
+                                      self.grid.height, known, occupied)
             if found and (best is None or found[1] < best[1]):
                 best = found
         return best
     
     def dump_work_path(self, coord: Coord,
-                       occupied: set[Coord] | None = None):
+                       occupied: set[Coord] | None = None,
+                       blocked: set[Coord] | None = None):
         """Like dump_work_cell, but also returns the route, so callers
         can measure elevation gain. Returns (cell, dist, path) or None."""
         best = None
+        known = self.blocked_cells() if blocked is None else blocked
         for block in self.dump_blocks:
             found = nearest_work_path(coord, block, self.grid.width,
-                                      self.grid.height,
-                                      self.blocked_cells(), occupied)
+                                      self.grid.height, known, occupied)
             if found and (best is None or found[1] < best[1]):
                 best = found
         return best

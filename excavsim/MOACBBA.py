@@ -102,6 +102,27 @@ SWITCH_MARGIN = 0.20       # en-route switch must be this much cheaper
 # information a robot gains en route is worth more. Enable with
 # MOACBBAAllocator(enable_switching=True).
 ENABLE_SWITCHING = False
+# How many tasks a robot may add to its bundle in ONE auction round.
+#
+# The problem this fixes: createBundle used to fill the whole bundle
+# (up to L_t = 6 tasks) before a single message was exchanged. So in
+# round 1 every robot decided its entire schedule from the SAME stale
+# c_k -- and with N robots there is always exactly one bottleneck and
+# N-1 robots who all correctly compute "extra work is free for me"
+# (measured: 3 of 4 robots in 99.5% of ticks). All of them then took
+# work on that basis, and after they did, several had passed the
+# bottleneck they were measuring themselves against. The work was not
+# free after all; they just could not know it yet.
+#
+# Adding one task per round forces a broadcast between every decision,
+# so the second task is chosen against a c_k that already reflects the
+# first. Robots still cannot un-take work -- createBundle only grows,
+# and only releaseOutbid shrinks -- so the fix is to stop them
+# over-committing rather than to let them back out.
+#
+# None = old behaviour (fill the bundle in one round).
+MAX_ADDS_PER_ROUND = 1
+
 ROUND_CEILING = 200
 
 
@@ -206,7 +227,7 @@ class MOACBBAAgent:
 
     # ---------------- bundle ---------------------------------------- #
     def createBundle(self, model, robot, seats_fn, c_max, v_max,
-                     kappa, limit) -> None:
+                     kappa, limit, max_adds=None) -> None:
         me = robot.robot_id
         others_c = self.othersCompletion(me)
         # Expected sharers: what the task will look like once seated,
@@ -216,7 +237,10 @@ class MOACBBAAgent:
         def expected(task):
             n = len(task.assignees) + (0 if me in task.assignees else 1)
             return min(n, seats_fn(task))
+        added = 0
         while len(self.bundle) < limit:
+            if max_adds is not None and added >= max_adds:
+                break              # broadcast, hear the others, then continue
             base_t, base_e = self.pathCost(model, robot, self.path, expected)
             if base_t >= INF:
                 break
@@ -254,6 +278,7 @@ class MOACBBAAgent:
             self.bundle.append(j)
             self.path.insert(n, j)
             self.place(j, me, cost)
+            added += 1
 
     def releaseOutbid(self, robot, seats_fn, model) -> None:
         """Losing a seat invalidates every marginal cost after it, so the
@@ -337,7 +362,9 @@ class MOACBBAAllocator:
                  min_share: float = MIN_SHARE,
                  capacity_affinity: float = CAPACITY_AFFINITY,
                  switch_margin: float = SWITCH_MARGIN,
-                 enable_switching: bool = ENABLE_SWITCHING) -> None:
+                 enable_switching: bool = ENABLE_SWITCHING,
+                 max_adds_per_round: int | None = MAX_ADDS_PER_ROUND) -> None:
+        self.max_adds_per_round = max_adds_per_round
         self.max_sharers = int(max_sharers)
         self.min_share = float(min_share)
         self.capacity_affinity = float(capacity_affinity)
@@ -402,7 +429,8 @@ class MOACBBAAllocator:
             for robot in robots:
                 agent = self._agent(robot)
                 agent.createBundle(model, robot, seats_fn, c_max, v_max,
-                                   self.capacity_affinity, robot.bundle_limit)
+                                   self.capacity_affinity, robot.bundle_limit,
+                                   self.max_adds_per_round)
                 agent.broadcast(robot, self._clock,
                                 lambda t: max(1, min(len(t.assignees) or 1,
                                                      seats_fn(t))))

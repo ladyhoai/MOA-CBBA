@@ -64,8 +64,9 @@ dbg_on = solara.reactive(True)        # master switch for every overlay
 dbg_paths = solara.reactive(True)     # planned A* routes
 dbg_targets = solara.reactive(True)   # p* (dig cell) and q* (unload cell)
 dbg_ids = solara.reactive(True)       # R0.. / T0.. labels
-dbg_blocked = solara.reactive(False)  # everything blocked_cells() returns
-dbg_comms = solara.reactive(False)    # who can hear whom
+dbg_blocked = solara.reactive(True)   # everything blocked_cells() returns
+dbg_comms = solara.reactive(True)     # who can hear whom
+dbg_sensor = solara.reactive(True)    # lidar disc + what the robot cannot see
 dbg_focus = solara.reactive("all")    # "all" or "R3": draw one robot only
 log_level = solara.reactive("info")   # event-log threshold
 
@@ -317,6 +318,7 @@ def SidePanel(model):
 
         # --- health line: the one-glance "is anything wrong" ---------- #
         HealthLine(mon)
+        ConfigPanel(model)
 
         # --- overlay switches ---------------------------------------- #
         DebugSwitches(model)
@@ -326,6 +328,60 @@ def SidePanel(model):
         solara.DataFrame(robot_frame(model), items_per_page=12)
         solara.Markdown("**Tasks**")
         solara.DataFrame(task_frame(model), items_per_page=10)
+
+
+@solara.component
+def ConfigPanel(model):
+    """What this run is ACTUALLY configured as.
+
+    Every value here is read off the live model object, never off
+    model_params. The two can disagree -- model_params is what the
+    widgets will send on the NEXT Reset, the model is what is running
+    now -- and when they did, there was no way to tell from the screen.
+    """
+    update_counter.get()
+    a = model.allocator
+    rng = model.comms.comm_range
+    dyn = model.dynamics
+
+    def row(k, v):
+        return f"| {k} | {v} |"
+
+    rows = [
+        row("allocator", f"`{getattr(a, 'name', type(a).__name__)}`"),
+        row("fleet", f"`{model.fleet_mode}` — "
+                     + ", ".join(f"{k}×{v}" for k, v in
+                                 sorted(model.fleet_summary.items()))),
+        row("robots / tasks", f"{len(model.robots)} / {len(model.tasks.all)}"),
+        row("objective", f"w1={model.w1:g}, w2={model.w2:g}"),
+        row("comm range", "unlimited" if rng is None else f"{rng:g} cells"),
+        row("lidar sensing", "ON" if model.sensing_enabled else "OFF (omniscient)"),
+    ]
+    if model.sensing_enabled:
+        radii = ", ".join(f"R{r.robot_id} {r.sensor_radius:.1f}"
+                          for r in model.robots)
+        rows.append(row("sensor radius now", radii))
+    rows += [
+        row("hazards", f"rate {dyn.hazard_rate:g}, size {dyn.hazard_size}, "
+                       f"{dyn.hazard_duration}t"),
+        row("obstacles", f"rate {dyn.obstacle_rate:g}, "
+                         f"max {dyn.max_obstacles}"),
+        row("weather", dyn.weather if dyn.weather_enabled else "off"),
+        row("grid", f"{model.grid.width}×{model.grid.height}, "
+                    f"{len(model.dump_blocks)} dump sites"),
+        row("seed", getattr(model, "_seed", "—")),
+    ]
+    # allocator-specific knobs, only the ones this allocator actually has
+    for key, label in (("max_sharers", "max robots/task"),
+                       ("capacity_affinity", "capacity affinity κ"),
+                       ("enable_switching", "en-route switching"),
+                       ("max_adds_per_round", "bundle adds/round"),
+                       ("min_share", "min share/seat")):
+        if hasattr(a, key):
+            rows.append(row(label, f"`{getattr(a, key)}`"))
+
+    with solara.Details("Current configuration", expand=False):
+        solara.Markdown("| | |\n|---|---|\n" + "\n".join(rows))
 
 
 @solara.component
@@ -369,6 +425,11 @@ def DebugSwitches(model):
                             on_value=toggle(dbg_blocked))
             solara.Checkbox(label="comm links", value=dbg_comms.value,
                             on_value=toggle(dbg_comms))
+            solara.Checkbox(label="lidar", value=dbg_sensor.value,
+                            on_value=toggle(dbg_sensor))
+        solara.Markdown("_pick one robot below to see its **blind spot** "
+                        "(red ×) — cells that are blocked but absent from "
+                        "its map._")
         solara.ToggleButtonsSingle(
             value=dbg_focus.value,
             values=["all"] + [f"R{r.robot_id}" for r in model.robots],
@@ -466,8 +527,13 @@ def DebugPanel(model):
 # ------------------------------------------------------------------ #
 # Assembly
 # ------------------------------------------------------------------ #
+# Must match model_params["allocator"]["value"], or the first frame runs
+# one allocator while the widget claims another -- the same disagreement
+# between the widgets and the live model that the config panel exists to
+# expose.
 model_instance = ExcavationModel(
-    seed=1, allocator="cbpae",
+    seed=42, allocator="moa-cbba",
+    weather_enabled=True, weather_change_rate=0.05,
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
     hazard_rate=0.05, hazard_size=2, hazard_duration=5,
@@ -554,11 +620,59 @@ def _draw_blocked(ax, model):
     _clear(ax, "_dbg_blocked")
     if not (dbg_on.value and dbg_blocked.value):
         return
-    for (x, y) in model.blocked_cells():
+    # DYNAMIC blockage only. Hatching everything blocked_cells() returns
+    # meant re-drawing every bedrock ridge and dump block on top of the
+    # terrain layer that already draws them in black and blue -- pure
+    # noise over most of the map. What is worth seeing is the part that
+    # was not there a moment ago and will not be there shortly.
+    for (x, y) in model.dynamics.blocked():
         rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
                              hatch="///", edgecolor="#222222", lw=0.0,
                              alpha=0.45, zorder=7)
         rect._gid = "_dbg_blocked"
+        ax.add_patch(rect)
+
+
+def _draw_sensor(ax, model):
+    """The lidar disc, and — in focus mode — the blind spot.
+
+    With sensing on, a robot plans against `known_blocked()`, not the
+    truth. The gap between those two is the single most useful thing to
+    see on this map and the only one that cannot be inferred from any
+    other overlay: a route that looks reckless is usually a route into a
+    hazard the robot has no way of knowing about yet.
+
+    Solid ring   = current sensing radius (sigma_i x weather scale)
+    Red hatching = truly blocked, NOT in this robot's map (focus mode)
+    """
+    _clear(ax, "_dbg_sensor")
+    if not (dbg_on.value and dbg_sensor.value
+            and getattr(model, "sensing_enabled", False)):
+        return
+    for r in model.robots:
+        if not _focused(r):
+            continue
+        x, y = r.cell.coordinate
+        disc = plt.Circle((x, y), r.sensor_radius, fill=False,
+                          ec=robot_color(r.robot_id), lw=1.0, ls=":",
+                          alpha=0.75, zorder=5)
+        disc._gid = "_dbg_sensor"
+        ax.add_patch(disc)
+
+    # Blind spot only makes sense for ONE robot: with "all" selected the
+    # unknown sets differ per robot and overlaying them means nothing.
+    if dbg_focus.value == "all":
+        return
+    rid = int(dbg_focus.value[1:])
+    robot = next((r for r in model.robots if r.robot_id == rid), None)
+    if robot is None:
+        return
+    unknown = model.dynamics.blocked() - robot.known_blocked()
+    for (x, y) in unknown:
+        rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
+                             hatch="xxx", edgecolor="#c0392b", lw=0.0,
+                             alpha=0.85, zorder=8)
+        rect._gid = "_dbg_sensor"
         ax.add_patch(rect)
 
 
@@ -681,6 +795,7 @@ def fit_canvas(ax):
     # that crashes the run it is debugging is worse than no debug view.
     try:
         _draw_blocked(ax, model)
+        _draw_sensor(ax, model)
         _draw_comms(ax, model)
         _draw_paths(ax, model)
         _draw_targets(ax, model)
@@ -706,11 +821,33 @@ model_params = {
         "label": "allocator",
     },
     "fleet_mode": {
+        # Must match ExcavationModel's own default. SolaraViz passes every
+        # entry in model_params to the constructor on Reset, so a stale
+        # value here silently OVERRIDES the model default -- which is how
+        # this read "capacity" while the code had moved to "full".
         "type": "Select",
-        "value": "capacity",
+        "value": "full",
         "values": ["none", "capacity", "full"],
-        "label": "fleet heterogeneity (Phase 2)",
+        "label": "fleet heterogeneity",
     },
+    "sensing_enabled": {
+        "type": "Checkbox",
+        "value": True,
+        "label": "lidar sensing (off = omniscient)",
+    },
+    "comm_range": Slider("comm range (0 = unlimited)", 10.0, 0.0, 45.0, 1.0),
+    "w1": Slider("w1 (makespan weight)", 1.0, 0.0, 5.0, 0.25),
+    "w2": Slider("w2 (energy weight)", 1.0, 0.0, 5.0, 0.25),
+    "hazard_rate": Slider("hazard rate", 0.0, 0.0, 0.5, 0.05),
+    "obstacle_rate": Slider("obstacle rate", 0.0, 0.0, 0.6, 0.05),
+    "weather_enabled": {
+        "type": "Checkbox", "value": True, "label": "weather",
+    },
+    # Enabling weather with rate 0 leaves it on "clear" forever, and
+    # clear has sensor_scale = traction_scale = 1.0 -- i.e. the switch
+    # appears on and does precisely nothing.
+    "weather_change_rate": Slider("weather change rate", 0.05, 0.0, 0.3, 0.01),
+    "bedrock_ridges": Slider("bedrock ridges", 6, 0, 15, 1),
     "width": 32,
     "height": 32,
 }

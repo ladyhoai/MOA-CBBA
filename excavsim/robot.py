@@ -44,6 +44,18 @@ STUCK_LIMIT = 2
 # exist at the physics layer where it applies to every allocator equally.
 UNREACHABLE_PATIENCE = 20
 
+# How long a sighting stays in the occupancy map without being seen
+# again.
+#
+# Sightings originally never expired: a cell was only cleared if the
+# robot went back and saw it empty. That is wrong, because hazards last
+# 5-40 ticks and obstacles WANDER, so a cell seen blocked and then left
+# behind is usually clear long before anyone returns. The map filled
+# with ghosts and the fleet routed around hazards that no longer
+# existed. An expiry is the cheapest correct answer: believe what you
+# saw, but not forever.
+MAP_TTL = 30
+
 
 class ExcavatorRobot(CellAgent):
     """One excavation robot. `model` is an ExcavationModel."""
@@ -78,6 +90,15 @@ class ExcavatorRobot(CellAgent):
         self._unload_left = 0
         self._stuck = 0
         self._waiting = 0      # consecutive ticks making no progress
+        # Occupancy memory: dynamic cells (hazards, obstacles) this robot
+        # has SEEN blocked and not yet seen cleared. Static terrain is
+        # not in here -- see known_blocked.
+        # Occupancy map: dynamic cell -> tick this robot SAW it blocked.
+        # First-hand only; robots do not share maps.
+        self._map: dict[tuple[int, int], int] = {}
+        # Total volume actually unloaded at a dump site. The third term
+        # of the conservation identity checked in debug.py.
+        self.soil_delivered = 0.0
 
         self.robot_id = len(model.robots)
 
@@ -129,7 +150,7 @@ class ExcavatorRobot(CellAgent):
         found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                   self.model.grid.width,
                                   self.model.grid.height,
-                                  self.model.blocked_cells(),
+                                  self.known_blocked(),
                                   claimed)
         if found is None:
             if shared:
@@ -141,14 +162,15 @@ class ExcavatorRobot(CellAgent):
             found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                       self.model.grid.width,
                                       self.model.grid.height,
-                                      self.model.blocked_cells())
+                                      self.known_blocked())
             if found is None:
                 return False
         work_cell, _ = found
         # q* is chosen once, from p*, at assignment time -- but it can
         # legitimately fail (no dump reachable), and indexing [0] on the
         # None return crashed the allocator instead of skipping the task.
-        dump = self.model.dump_work_cell(work_cell)
+        dump = self.model.dump_work_cell(work_cell,
+                                         blocked=self.known_blocked())
         if dump is None:
             return False
 
@@ -184,6 +206,20 @@ class ExcavatorRobot(CellAgent):
         if self.task_id is None:
             return
         task = self.model.tasks.get(self.task_id)
+        # Conservation guard. Every caller should already have checked
+        # can_abandon (stage TO_TASK, empty hopper -- Das et al. Sec.
+        # 3.7.4), so this should never fire. If one slips through, put
+        # the soil back in the ground rather than let it vanish into a
+        # hopper: the volume was subtracted from task.remaining when it
+        # was dug, so returning it is what keeps
+        #     soil in ground + soil in hoppers + soil at dump
+        # constant. Better a task that looks briefly bigger than a
+        # makespan computed over soil nobody ever moved.
+        if self.payload > 1e-9:
+            task.remaining += self.payload
+            self.model.grid.soil_volume.data[task.cell] += self.payload
+            task.completed_tick = None      # it is demonstrably not done
+            self.payload = 0.0
         task.drop_assignee(self.robot_id)
         # A robot can leave an ALREADY-EMPTY task through this path (no
         # reachable dump). If it was the last seat, nothing else will
@@ -234,13 +270,77 @@ class ExcavatorRobot(CellAgent):
     # movement with collision avoidance
     # ------------------------------------------------------------------ #
     # TODO: CHANGE THIS TO LIDAR ROBOT DETECTION
+    # ------------------------------------------------------------------ #
+    # sensing (sigma_i, Phase 3)
+    # ------------------------------------------------------------------ #
+    @property
+    def sensor_radius(self) -> float:
+        """Effective sensing range this tick: the spec's sigma_i degraded
+        by weather. Fog scales it to 0.4 and storm to 0.3, so a small
+        machine (sigma = 6) sees barely two cells in a storm while a
+        large one (sigma = 10) still sees three."""
+        return self.spec.sensor_range * self.model.dynamics.sensor_scale()
+
+    def sense(self) -> None:
+        """Update the occupancy memory from what is visible right now.
+
+        Two directions, and the second one matters as much as the first:
+        cells inside the radius that are blocked get REMEMBERED, and
+        cells inside the radius that are clear get FORGOTTEN. Without the
+        forgetting, an expired hazard would be avoided for the rest of
+        the run; without the remembering, a robot would forget an
+        obstacle the moment it turned away and oscillate in front of it.
+
+        Only DYNAMIC blockage is sensed. Bedrock and dump sites are
+        surveyed before work starts, so they belong in the map, not in
+        the sensor -- see known_blocked.
+        """
+        if not getattr(self.model, "sensing_enabled", False):
+            return
+        r = self.sensor_radius
+        if r <= 0.0:
+            return
+        cx, cy = self.cell.coordinate
+        live = self.model.dynamics.blocked()
+        now = self.model.tick
+        rr = r * r
+        lo_x, hi_x = int(cx - r), int(cx + r)
+        lo_y, hi_y = int(cy - r), int(cy + r)
+        for x in range(lo_x, hi_x + 1):
+            for y in range(lo_y, hi_y + 1):
+                dx, dy = x - cx, y - cy
+                if dx * dx + dy * dy > rr:
+                    continue                     # outside the disc
+                c = (x, y)
+                if c in live:
+                    self._map[c] = now           # fresh first-hand sighting
+                else:
+                    # My own eyes beat anything I was told: a cell I can
+                    # see is clear IS clear, whoever said otherwise.
+                    self._map.pop(c, None)
+
+        # Everything else ages out.
+        cutoff = now - MAP_TTL
+        for c in [k for k, t in self._map.items() if t < cutoff]:
+            del self._map[c]
+
+    def known_blocked(self) -> set[tuple[int, int]]:
+        """What THIS robot believes is impassable: the surveyed map plus
+        whatever its sensor has found. Everything planned or bid on goes
+        through here rather than model.blocked_cells(), so a robot can
+        route straight into a hazard it has not seen yet -- and then
+        re-route when it comes into range, which is the whole point."""
+        if not getattr(self.model, "sensing_enabled", False):
+            return self.model.blocked_cells()
+        return self.model._static_blocked() | self._map.keys()
+
     def _other_robot_cells(self) -> set[tuple[int, int]]:
         return {r.cell.coordinate for r in self.model.robots if r is not self}
 
     def _plan_leg(self, dest: tuple[int, int],
                   avoid_robots: bool = False) -> None:
         self._dest = dest
-        blocked = self.model.blocked_cells()
+        blocked = self.known_blocked()
         if avoid_robots:
             blocked = blocked | self._other_robot_cells()
         path = astar(self.cell.coordinate, dest,
@@ -318,11 +418,13 @@ class ExcavatorRobot(CellAgent):
             found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                       self.model.grid.width,
                                       self.model.grid.height,
-                                      self.model.blocked_cells(), occupied)
+                                      self.known_blocked(), occupied)
             if found is not None:
                 self.work_cell = found[0]
         elif self.stage is Stage.TO_DUMP:
-            found = self.model.dump_work_cell(self.cell.coordinate, occupied)
+            found = self.model.dump_work_cell(
+                self.cell.coordinate, occupied,
+                blocked=self.known_blocked())
             if found is not None:
                 self.dump_cell = found[0]
         dest = (self.work_cell if self.stage is Stage.TO_TASK
@@ -369,9 +471,28 @@ class ExcavatorRobot(CellAgent):
 
     def _go_dump(self) -> None:
         if self.dump_cell is None:  # q* chosen once per task, from p*
-            found = self.model.dump_work_cell(self.work_cell)
-            if found is None:       # no dump reachable: give it back
-                self._release_task()
+            found = self.model.dump_work_cell(
+                self.work_cell, blocked=self.known_blocked())
+            if found is None:
+                # No reachable dump AND soil in the hopper. This used to
+                # call _release_task(), which drops the task and the seat
+                # but never touches self.payload -- so the volume was
+                # already subtracted from task.remaining at dig time,
+                # never delivered, and carried around for the rest of the
+                # run. Measured: 0.34-0.99 units stranded per CBPAE run,
+                # tasks stamped complete on soil sitting in a hopper, the
+                # robot permanently short of that much capacity, and the
+                # haul energy for it never charged.
+                #
+                # A loaded machine cannot abandon its load, so it WAITS
+                # in place and retries. _dig_tick calls _go_dump again on
+                # the next tick, and hazards expire, so this clears
+                # itself. It cannot hang forever: the wait counter feeds
+                # the monitor's stall check, and the task is still held
+                # so nothing else is blocked by it being in limbo.
+                self.wait_ticks += 1
+                self._waiting += 1
+                self._path = []
                 return
             self.dump_cell, _ = found
         self.stage = Stage.TO_DUMP
@@ -381,6 +502,7 @@ class ExcavatorRobot(CellAgent):
         self._unload_left -= 1
         if self._unload_left > 0:
             return
+        self.soil_delivered += self.payload    # conservation bookkeeping
         self.payload = 0.0  # E_unload = 0 by assumption
         task = self.model.tasks.get(self.task_id)
         if task.done:
