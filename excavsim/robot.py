@@ -20,8 +20,6 @@ sent uphill more" are different findings and the total cannot tell them
 apart. The GUI inspector reads these.
 """
 
-# TODO: LIDAR range -- _other_robot_cells currently gives every robot
-# omniscient knowledge of every other robot's position.
 
 from __future__ import annotations
 
@@ -55,6 +53,55 @@ UNREACHABLE_PATIENCE = 20
 # existed. An expiry is the cheapest correct answer: believe what you
 # saw, but not forever.
 MAP_TTL = 30
+
+# Obstacles wander every tick with probability obstacle_move_probability
+# (0.5 by default), so where one was seen three ticks ago says almost
+# nothing about where it is now. Remembering them on the hazard timescale
+# was pure ghost generation: MAP_TTL = 30 kept a wandering machine pinned
+# to a cell it had left twenty-something ticks earlier.
+OBSTACLE_TTL = 3
+
+# Cells adjacent to an obstacle seen THIS TICK.
+#
+# The arithmetic, corrected. dynamics moves an obstacle with probability
+# obstacle_move_probability (0.5) and then picks uniformly among its
+# free neighbours, so for any ONE ring cell
+#
+#     P(occupied next tick) = 0.5 * 1/|options| ~= 0.5/8 = 6.25%
+#
+# not the 50% an earlier version of this comment claimed. The 50% figure
+# is the chance it moves into SOME ring cell, and a route crosses one or
+# two of the eight, not all of them. (The genuinely 50% cell is the one
+# the obstacle already occupies -- it stays put half the time -- and that
+# cell is in known_blocked already.)
+#
+# The ring is a ONE-TICK prediction, so it may only be applied to cells
+# the robot reaches in about one tick. An obstacle performs a random
+# walk with p = 0.5, so its expected displacement after t ticks is about
+# sqrt(0.5 t) per axis: 0.7 cells after 1 tick, 1.0 after 2, 1.6 after
+# 5. The ring is one cell wide, so beyond ~2 ticks the obstacle is
+# typically outside it and the ring is superstition. HALO_HORIZON was 6
+# CELLS, which at v_max 0.8-1.2 is 5 to 7.5 ticks -- three times past
+# the point where the prediction means anything.
+#
+# Measured in CELLS but compared in CHEBYSHEV distance, because that is
+# the metric the robot actually moves in: a diagonal step costs one step
+# like any other. The old Euclidean test made the horizon anisotropic,
+# reaching a full 6 steps along the axes but only 4 diagonally.
+HALO_HORIZON = 2
+
+# Plan around robots the sensor can see, instead of only after walking
+# into one.
+#
+# Measured cause of blocking over four seeds: 46.4% no route at all,
+# 32.0% hazards, 18.7% ROBOTS, 2.9% obstacles. And every one of the
+# robot collisions was with a machine the blocked robot could SEE --
+# none were out of sensor range. The information was there; _plan_leg
+# simply never asked, because avoid_robots defaulted to False at all
+# four normal call sites and only _reroute passed True. So the sequence
+# was: plan straight through a visible machine, hit it, burn
+# STUCK_LIMIT ticks, then re-plan around it.
+AVOID_ROBOTS_WHEN_PLANNING = True
 
 
 class ExcavatorRobot(CellAgent):
@@ -90,9 +137,12 @@ class ExcavatorRobot(CellAgent):
         self._unload_left = 0
         self._stuck = 0
         self._waiting = 0      # consecutive ticks making no progress
-        # Occupancy memory: dynamic cells (hazards, obstacles) this robot
-        # has SEEN blocked and not yet seen cleared. Static terrain is
-        # not in here -- see known_blocked.
+        # Wandering obstacles, kept apart from hazards because they age
+        # on a completely different timescale. cell -> tick seen.
+        self._obstacles: dict[tuple[int, int], int] = {}
+        # Occupancy memory: hazard cells this robot has SEEN blocked and
+        # not yet seen cleared. Static terrain is not in here -- see
+        # known_blocked.
         # Occupancy map: dynamic cell -> tick this robot SAW it blocked.
         # First-hand only; robots do not share maps.
         self._map: dict[tuple[int, int], int] = {}
@@ -146,7 +196,7 @@ class ExcavatorRobot(CellAgent):
         # robots a task is worth); the robot only enforces physics --
         # it cannot stand where a co-worker is already standing.
         shared = bool(task.assignees)
-        claimed = self.model.claimed_work_cells(exclude=self)
+        claimed = self.model.claimed_work_cells(exclude=self, observer=self)
         found = nearest_work_cell(self.cell.coordinate, [task.cell],
                                   self.model.grid.width,
                                   self.model.grid.height,
@@ -301,7 +351,9 @@ class ExcavatorRobot(CellAgent):
         if r <= 0.0:
             return
         cx, cy = self.cell.coordinate
-        live = self.model.dynamics.blocked()
+        dyn = self.model.dynamics
+        hazards = dyn.hazard_cells()
+        obstacles = dyn.obstacle_cells()
         now = self.model.tick
         rr = r * r
         lo_x, hi_x = int(cx - r), int(cx + r)
@@ -312,17 +364,24 @@ class ExcavatorRobot(CellAgent):
                 if dx * dx + dy * dy > rr:
                     continue                     # outside the disc
                 c = (x, y)
-                if c in live:
-                    self._map[c] = now           # fresh first-hand sighting
+                # Two registers, because the two things age differently.
+                if c in hazards:
+                    self._map[c] = now
                 else:
-                    # My own eyes beat anything I was told: a cell I can
-                    # see is clear IS clear, whoever said otherwise.
                     self._map.pop(c, None)
+                if c in obstacles:
+                    self._obstacles[c] = now
+                else:
+                    self._obstacles.pop(c, None)
 
-        # Everything else ages out.
+        # Age out. Hazards sit still, so they keep for MAP_TTL; obstacles
+        # wander, so a sighting is worthless within a few ticks.
         cutoff = now - MAP_TTL
         for c in [k for k, t in self._map.items() if t < cutoff]:
             del self._map[c]
+        ob_cutoff = now - OBSTACLE_TTL
+        for c in [k for k, t in self._obstacles.items() if t < ob_cutoff]:
+            del self._obstacles[c]
 
     def known_blocked(self) -> set[tuple[int, int]]:
         """What THIS robot believes is impassable: the surveyed map plus
@@ -332,20 +391,121 @@ class ExcavatorRobot(CellAgent):
         re-route when it comes into range, which is the whole point."""
         if not getattr(self.model, "sensing_enabled", False):
             return self.model.blocked_cells()
-        return self.model._static_blocked() | self._map.keys()
+        return (self.model._static_blocked() | self._map.keys()
+                | self._obstacles.keys())
+
+    def obstacle_halo(self, origin: tuple[int, int]) -> set[tuple[int, int]]:
+        """Cells an obstacle seen THIS TICK may step into on the next.
+
+        Three corrections against the first version, all of them making
+        the ring smaller and the claim honest -- see HALO_HORIZON above
+        for the arithmetic:
+
+          - CHEBYSHEV distance, not Euclidean, because that is the metric
+            the robot moves in.
+          - HALO_HORIZON = 2, not 6, because a one-cell ring is only a
+            valid prediction about one or two ticks ahead.
+          - Only sightings from the CURRENT tick. _obstacles holds them
+            for OBSTACLE_TTL ticks, and a three-tick-old position is
+            already ~1.2 cells wrong, so drawing a one-cell ring around
+            it compounds a stale position with a short-lived prediction.
+
+        The honest expected value is small: about 6% per ring cell
+        crossed. This is a cheap hedge, not a large win, and it should
+        not be described as one.
+        """
+        out: set[tuple[int, int]] = set()
+        if not self._obstacles:
+            return out
+        ox, oy = origin
+        now = self.model.tick
+        w, h = self.model.grid.width, self.model.grid.height
+        for (cx, cy), seen in self._obstacles.items():
+            if seen < now:
+                continue                     # stale position, stale ring
+            if max(abs(cx - ox), abs(cy - oy)) > HALO_HORIZON:
+                continue
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    n = (cx + dx, cy + dy)
+                    if 0 <= n[0] < w and 0 <= n[1] < h:
+                        out.add(n)
+        return out
+
+    def visible_robots(self) -> list:
+        """Other robots this one can currently SEE.
+
+        Positions are sensed, never remembered: a robot moves every tick,
+        so a sighting from ten ticks ago is worse than no information at
+        all -- it would have the planner routing around a machine that
+        has long since driven off. Contrast the obstacle map, which is
+        remembered precisely because hazards sit still.
+        """
+        if not getattr(self.model, "sensing_enabled", False):
+            return [r for r in self.model.robots if r is not self]
+        rr = self.sensor_radius ** 2
+        cx, cy = self.cell.coordinate
+        out = []
+        for r in self.model.robots:
+            if r is self:
+                continue
+            ox, oy = r.cell.coordinate
+            if (ox - cx) ** 2 + (oy - cy) ** 2 <= rr:
+                out.append(r)
+        return out
 
     def _other_robot_cells(self) -> set[tuple[int, int]]:
+        """For PLANNING: only robots in sensor range. A robot cannot steer
+        around a machine it has no way of knowing is there."""
+        return {r.cell.coordinate for r in self.visible_robots()}
+
+    def _all_robot_cells(self) -> set[tuple[int, int]]:
+        """For PHYSICS: every robot, seen or not. Two machines cannot
+        occupy one cell regardless of who noticed whom -- not seeing
+        something is not permission to drive through it. The gap between
+        this and _other_robot_cells is exactly where unseen robots cause
+        real waits instead of tidy detours."""
         return {r.cell.coordinate for r in self.model.robots if r is not self}
 
     def _plan_leg(self, dest: tuple[int, int],
-                  avoid_robots: bool = False) -> None:
+                  avoid_robots: bool = AVOID_ROBOTS_WHEN_PLANNING) -> None:
+        """Route to `dest`, avoiding what can actually be avoided.
+
+        Two kinds of blockage, and they must not be treated alike:
+
+        HARD -- bedrock, dump blocks, sensed hazards. These do not move,
+        so a route through them is not a route.
+
+        SOFT -- other robots, and the obstacle halo. A machine standing
+        in the way will drive off; a halo cell is only ~6% likely to be
+        occupied at all. Treating either as a wall makes reachable work
+        look impossible, so both are PREFERENCES: plan with them, drop
+        them if that leaves no route.
+
+        Preferences are dropped weakest-evidence-first: the halo goes
+        before the robots do, because a machine is standing there NOW
+        whereas the halo is a guess about the next tick.
+        """
         self._dest = dest
-        blocked = self.known_blocked()
-        if avoid_robots:
-            blocked = blocked | self._other_robot_cells()
-        path = astar(self.cell.coordinate, dest,
-                     self.model.grid.width, self.model.grid.height,
-                     blocked=blocked)
+        hard = self.known_blocked()
+        w, h = self.model.grid.width, self.model.grid.height
+        start = self.cell.coordinate
+
+        soft = self._other_robot_cells() if avoid_robots else set()
+        halo = set()
+        if getattr(self.model, "obstacle_halo_enabled", False):
+            halo = self.obstacle_halo(start)
+
+        path = None
+        tried = []
+        for extra in ((soft | halo) - {dest}, soft - {dest}, set()):
+            if extra in tried:
+                continue          # same search as a tier already run
+            tried.append(extra)
+            path = astar(start, dest, w, h, hard | extra)
+            if path:
+                break
+
         self._path = path[1:] if path else []
         self._move_credit = 0.0
         self._stuck = 0
@@ -370,7 +530,7 @@ class ExcavatorRobot(CellAgent):
           happened to be standing -- soil deleted without ever reaching a
           dump site, and the task possibly closed out on the strength of
           it."""
-        occupied = self._other_robot_cells() | self.model.dynamics.blocked()
+        occupied = self._all_robot_cells() | self.model.dynamics.blocked()
         if not self._path:
             if self._dest is None or self.cell.coordinate == self._dest:
                 return True
@@ -395,7 +555,17 @@ class ExcavatorRobot(CellAgent):
     def _wait_blocked(self, occupied: set[tuple[int, int]]) -> None:
         """One tick of no progress: forfeit banked motion, count the wait,
         re-route on STUCK_LIMIT, and give the chunk back if this has been
-        going on long enough that nothing is coming of it."""
+        going on long enough that nothing is coming of it.
+
+        `occupied` is the PHYSICAL set -- every robot and every hazard,
+        seen or not -- because that is what actually stops the wheels.
+        The re-plan gets a different set: only what this robot can sense.
+        Handing the physical set to _reroute would let a stuck machine
+        route around hazards and robots it has no way of knowing about,
+        which is omniscience smuggled in through the recovery path. The
+        machine that just blocked us is adjacent and therefore inside the
+        sensor disc anyway, so nothing needed is lost.
+        """
         self._move_credit = 0.0
         self._stuck += 1
         self._waiting += 1
@@ -404,7 +574,9 @@ class ExcavatorRobot(CellAgent):
             self._release_task()
             return
         if self._stuck >= STUCK_LIMIT:
-            self._reroute(occupied)
+            sensed = self._other_robot_cells() | (
+                self.known_blocked() - self.model._static_blocked())
+            self._reroute(sensed)
 
     # ------------------------------------------------------------------ #
     # work stages
@@ -431,15 +603,9 @@ class ExcavatorRobot(CellAgent):
                 else self.dump_cell)
         dest = dest if dest is not None else self._dest
         self._plan_leg(dest, avoid_robots=True)
-        # avoid_robots=True searches a STRICTLY LARGER blocked set than
-        # the plan that just failed, so escalating to it when already
-        # stuck can only ever return the same route or none at all --
-        # "re-planned (10, 7) -> (10, 7); path now 0 steps". Treating
-        # other robots as walls is the optimistic case (they move); fall
-        # back to routing through them rather than surrendering.
-        if not self._path and dest is not None \
-                and self.cell.coordinate != dest:
-            self._plan_leg(dest, avoid_robots=False)
+        # The explicit second attempt this used to need is gone:
+        # _plan_leg now falls back through its own preference tiers, so
+        # a failed robot-avoiding search already retries without them.
 
     def _dig_tick(self) -> None:
         task = self.model.tasks.get(self.task_id)

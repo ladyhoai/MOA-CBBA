@@ -53,6 +53,22 @@ class DynamicsManager: # This class will be instantiated by the model
     obstacles: list = field(default_factory=list)
     weather: str = "clear"
 
+    def hazard_cells(self) -> set[Coord]:
+        """Zone cells only. These STAY PUT until they expire, so a
+        sighting keeps its value for as long as the zone lives."""
+        out: set[Coord] = set()
+        for hazard in self.hazards:
+            out |= hazard.cells
+        return out
+
+    def obstacle_cells(self) -> set[Coord]:
+        """Wandering obstacles only. Each one steps with probability
+        obstacle_move_probability EVERY tick, so a sighting is stale
+        almost immediately -- which is why the robot ages these out far
+        faster than hazards, and why their NEIGHBOURHOOD matters more
+        than the cell they were last seen in."""
+        return {o.cell for o in self.obstacles}
+
     # Returning all blocked cells
     def blocked(self) -> set[Coord]:
         out: set[Coord] = set()

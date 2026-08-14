@@ -123,6 +123,26 @@ ENABLE_SWITCHING = False
 # None = old behaviour (fill the bundle in one round).
 MAX_ADDS_PER_ROUND = 1
 
+# Route around where a sensed obstacle is ABOUT to be, not just where it
+# was seen. Obstacles step with probability obstacle_move_probability
+# every tick, so the eight cells around one are a coin flip on being
+# blocked by the time a robot arrives -- and being blocked costs
+# STUCK_LIMIT waiting ticks plus a re-plan, while stepping one cell wide
+# costs at most one extra move.
+#
+# Deliberately a PREFERENCE with a fallback, not a wall: _plan_leg tries
+# the halo first and re-plans without it if that leaves no route. And
+# deliberately short-horizon (HALO_HORIZON in robot.py): the prediction
+# is only good for the next few ticks, after which the obstacle has
+# wandered somewhere unrelated.
+#
+# NOTE the honest cost: leg_cost prices bids on known_blocked() WITHOUT
+# the halo, while execution plans WITH it, so a halo detour is a length
+# the bid did not charge for. The gap is small -- a halo route is
+# typically one or two steps longer -- and it is a deliberate trade
+# against the wait it avoids, but it does widen bid-vs-actual.
+OBSTACLE_HALO = True
+
 ROUND_CEILING = 200
 
 
@@ -358,13 +378,15 @@ class MOACBBAAllocator:
     name = "moa-cbba"
     AGENT_ATTR = "MOACBBA"
 
-    def __init__(self, max_sharers: int = MAX_SHARERS,
+    def __init__(self, obstacle_halo: bool = OBSTACLE_HALO,
+                 max_sharers: int = MAX_SHARERS,
                  min_share: float = MIN_SHARE,
                  capacity_affinity: float = CAPACITY_AFFINITY,
                  switch_margin: float = SWITCH_MARGIN,
                  enable_switching: bool = ENABLE_SWITCHING,
                  max_adds_per_round: int | None = MAX_ADDS_PER_ROUND) -> None:
         self.max_adds_per_round = max_adds_per_round
+        self.obstacle_halo = bool(obstacle_halo)
         self.max_sharers = int(max_sharers)
         self.min_share = float(min_share)
         self.capacity_affinity = float(capacity_affinity)
@@ -397,6 +419,11 @@ class MOACBBAAllocator:
 
     # ---------------------------------------------------------------- #
     def allocate(self, model) -> None:
+        # Announce the routing policy every call rather than once at
+        # construction: SolaraViz swaps allocators on a live model, so a
+        # flag set in __init__ would outlive the allocator that wanted it.
+        model.obstacle_halo_enabled = self.obstacle_halo
+
         robots = list(model.robots)
         open_tasks = model.tasks.unfinished
         if not robots or not open_tasks:

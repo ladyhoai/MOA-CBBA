@@ -536,7 +536,7 @@ model_instance = ExcavationModel(
     weather_enabled=True, weather_change_rate=0.05,
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
-    hazard_rate=0.05, hazard_size=2, hazard_duration=5,
+    hazard_rate=0.05, hazard_size=2, hazard_duration=8,
     obstacle_rate=0.3, max_obstacles=10)
 
 renderer = SpaceRenderer(model_instance, backend="matplotlib")

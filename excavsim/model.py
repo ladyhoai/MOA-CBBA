@@ -143,6 +143,11 @@ class ExcavationModel(Model):
         super().__init__(rng=int(seed) if seed is not None else None)
         self.w1, self.w2 = w1, w2
         self.sensing_enabled = bool(sensing_enabled)
+        # Set by whichever allocator wants predictive obstacle avoidance;
+        # see MOACBBAAllocator. Off unless an allocator asks, so CBBA and
+        # CBPAE keep planning exactly as before and the mechanism stays a
+        # clean ablation axis rather than a change to the whole world.
+        self.obstacle_halo_enabled = False
         self.t_unload = T_UNLOAD
         self.tick = 0
         # Largest CBBA bundle any robot has held this run. Cheap, and
@@ -511,11 +516,23 @@ class ExcavationModel(Model):
         self.grid.elevation.data[:, :] = height_scale * field
 
 
-    def claimed_work_cells(self, exclude=None) -> set[Coord]:
+    def claimed_work_cells(self, exclude=None, observer=None) -> set[Coord]:
         """Work cells other robots have already committed to. Passed to
         nearest_work_cell at assignment so two robots sharing a site do
-        not both target the same dig position."""
-        return {r.work_cell for r in self.robots
+        not both target the same dig position.
+
+        `observer` restricts the answer to what that robot could actually
+        learn. A committed work cell is an INTENTION, not an object, so
+        it cannot be seen -- it has to be told. The filter is therefore
+        comm range, not sensor range: you see where a machine IS, you
+        hear where it is GOING. With comm_range=None this is unrestricted
+        and the old behaviour is reproduced exactly.
+        """
+        others = (self.robots if observer is None
+                  else [r for r in self.robots if r is not observer]
+                  if self.comms.comm_range is None
+                  else self.comms.neighbors(observer))
+        return {r.work_cell for r in others
                 if r is not exclude and r.work_cell is not None}
 
     def _random_empty_coord(self) -> Coord:
