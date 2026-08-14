@@ -532,7 +532,7 @@ def DebugPanel(model):
 # between the widgets and the live model that the config panel exists to
 # expose.
 model_instance = ExcavationModel(
-    seed=42, allocator="moa-cbba",
+    seed=23, allocator="moa-cbba",
     weather_enabled=True, weather_change_rate=0.05,
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
@@ -555,15 +555,48 @@ def _live_model():
     return getattr(space, "model", None) or model_instance
 
 
+def _artist_lists(ax):
+    return (ax.lines, ax.patches, ax.collections, ax.texts)
+
+
 def _clear(ax, tag: str) -> None:
     """Remove every artist this module drew under `tag`. Matplotlib keeps
     lines, patches, collections and texts in separate lists and the
     renderer only clears some of them, so overlays stack up over frames
-    unless each family is swept."""
-    for seq in (ax.lines, ax.patches, ax.collections, ax.texts):
+    unless each family is swept.
+
+    remove() is guarded because it raises on an artist that is already
+    detached, and an exception here leaves the sweep half done -- some
+    overlays cleared, some not -- which is how orphans accumulate."""
+    for seq in _artist_lists(ax):
         for art in list(seq):
-            if getattr(art, "_gid", None) == tag:
+            if getattr(art, "_gid", None) != tag:
+                continue
+            try:
                 art.remove()
+            except (NotImplementedError, ValueError, AttributeError):
+                pass                     # already detached; nothing to do
+
+
+def _purge_orphans(ax) -> None:
+    """Drop artists that are still listed on the axes but no longer
+    attached to a figure.
+
+    Matplotlib dereferences the figure while drawing -- PathCollection
+    does `self.get_figure(root=True).dpi` -- so an orphan is not a
+    cosmetic problem, it is an AttributeError on None that kills the
+    whole render. Solara re-draws the figure from a cached callback
+    while post_process is mutating it, so the two can interleave and
+    leave an artist detached but still listed. Sweeping before drawing
+    costs one pass over a few dozen objects and makes the render
+    unkillable from this direction."""
+    for seq in _artist_lists(ax):
+        for art in list(seq):
+            if getattr(art, "figure", False) is None:
+                try:
+                    art.remove()
+                except Exception:
+                    pass
 
 
 def _focused(robot) -> bool:
@@ -784,16 +817,19 @@ def fit_canvas(ax):
     carries post_process across Reset, so the size survives resets."""
     ax.set_aspect("equal")
     ax.get_figure().set_size_inches(10.0, 10.0)
-    _draw_selection(ax)
-    _draw_hazards(ax)
-    _draw_obstacles(ax)
 
     model = _live_model()
-    if model is None:
-        return
-    # Overlays must not be able to take the dashboard down: a debug view
-    # that crashes the run it is debugging is worse than no debug view.
+    # EVERY overlay is inside the guard, not just the debug ones. A
+    # dashboard that crashes the run it is meant to observe is worse
+    # than no dashboard, and the three map overlays below were outside
+    # the try block purely by accident of the order they were written.
     try:
+        _purge_orphans(ax)
+        _draw_selection(ax)
+        _draw_hazards(ax)
+        _draw_obstacles(ax)
+        if model is None:
+            return
         _draw_blocked(ax, model)
         _draw_sensor(ax, model)
         _draw_comms(ax, model)

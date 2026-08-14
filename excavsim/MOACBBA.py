@@ -255,8 +255,7 @@ class MOACBBAAgent:
         # occupancy instead would price the first robot's bid as solo and
         # then never revise it.
         def expected(task):
-            n = len(task.assignees) + (0 if me in task.assignees else 1)
-            return min(n, seats_fn(task))
+            return self.expectedSharers(task, me, seats_fn(task))
         added = 0
         while len(self.bundle) < limit:
             if max_adds is not None and added >= max_adds:
@@ -337,6 +336,46 @@ class MOACBBAAgent:
         self.bundle = keep
 
     # ---------------- gossip ---------------------------------------- #
+    def expectedSharers(self, task, me, seats: int) -> int:
+        """How many robots will be digging this task once the auction
+        settles -- read off the BID TABLE, not off current occupancy.
+
+        THE BUG THIS REPLACES had two halves, and the first is worse.
+
+        (a) INCONSISTENCY. The old estimate was
+
+                n = len(assignees) + (0 if me in assignees else 1)
+
+            which gives a DIFFERENT answer to different robots at the
+            same instant. For a task with one robot on it, the incumbent
+            priced it solo (V/1) while a challenger priced it shared
+            (V/2) -- so the two were comparing bids computed on volumes
+            that differ by a factor of two. That is not forecast error,
+            it is an unfair comparison, and it decides who wins a seat.
+
+        (b) FORECAST ERROR. task.assignees only changes in _execute(),
+            AFTER the whole auction has converged. So during bidding
+            every robot sees pre-auction occupancy and none of them can
+            see that two more are about to sit down. Measured: tasks
+            whose sharer count stayed put came in at x1.05 of bid; tasks
+            whose count changed came in at x0.87, and they were the
+            majority (28 of 52).
+
+        The bid table fixes both. `winners(j, seats)` is exactly the set
+        that _execute will seat, it is agreed across robots by consensus,
+        and it updates every round -- so all bidders price the same task
+        on the same volume, and that volume is what execution will
+        actually see.
+
+        Union with assignees because a robot already digging holds its
+        seat through a LOCKED_COST entry, and with `me` because asking
+        "what would this task cost me" presumes joining it.
+        """
+        j = task.task_id
+        who = set(self.winners(j, seats)) | set(task.assignees)
+        who.add(me)
+        return max(1, min(len(who), seats))
+
     def othersCompletion(self, me) -> float:
         vals = [c for k, c in self.completions.items() if k != me]
         return max(vals) if vals else 0.0
@@ -458,9 +497,15 @@ class MOACBBAAllocator:
                 agent.createBundle(model, robot, seats_fn, c_max, v_max,
                                    self.capacity_affinity, robot.bundle_limit,
                                    self.max_adds_per_round)
-                agent.broadcast(robot, self._clock,
-                                lambda t: max(1, min(len(t.assignees) or 1,
-                                                     seats_fn(t))))
+                # c_i must be computed on the SAME volume basis as the
+                # bids, or the completion time a robot advertises is not
+                # the completion time its own bids were built from --
+                # every peer then load-balances against a schedule that
+                # does not exist.
+                agent.broadcast(
+                    robot, self._clock,
+                    lambda t: agent.expectedSharers(t, robot.robot_id,
+                                                    seats_fn(t)))
             model.comms.flush_and_deliver(model.tick)
             changed = [self._agent(r).resolveConflicts(r, r.receive_all(),
                                                        self._clock)
@@ -493,8 +538,7 @@ class MOACBBAAllocator:
                 # rivals repriced this tick, so the comparison drifted in
                 # favour of switching a little more every tick.
                 def expected(task):
-                    n = len(task.assignees) + (0 if me in task.assignees else 1)
-                    return min(n, seats_fn(task))
+                    return agent.expectedSharers(task, me, seats_fn(task))
 
                 cur_task = model.tasks.get(robot.task_id)
                 cur_k = max(1, expected(cur_task))

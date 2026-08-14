@@ -160,7 +160,7 @@ class ExcavationModel(Model):
         # feeds a leg cost can change inside a round.
         self._leg_cache: dict = {}
         self.changed_cells: set[Coord] = set()  # Algorithm 1, line 3 hook
-        print("Allocator used: ", allocator)
+        # print("Allocator used: ", allocator)
 
         # --- grid and property layers ---------------------------------- #
         self.grid = OrthogonalMooreGrid((width, height), torus=False,
