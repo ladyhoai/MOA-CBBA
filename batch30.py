@@ -21,6 +21,15 @@ loses where it does not. Plotting `cbba_idle` against `moa - cbba` tests
 that directly, and a conditional result ("wins when baseline idle is
 high") is worth more in a write-up than an average that hides the
 reversal.
+
+New-reader primer: this is the "real" experiment script (run_batch.py is
+a smaller Mesa-native example). For each of `--seeds` random seeds it
+runs the SAME randomly generated world (terrain, robots, tasks) once per
+allocator in ALLOCATORS, so the three algorithms are compared on
+identical instances rather than on luck. `run_one()` runs a single
+(seed, allocator) pair to completion and returns its metrics as a dict;
+`main()` (at the bottom of the file) loops over seeds/allocators, prints
+a running summary, and writes every row to batch30.csv.
 """
 
 from __future__ import annotations

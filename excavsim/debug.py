@@ -30,6 +30,15 @@ it in TO_TASK for the rest of the run; and (c) allocator disagreement,
 where two robots each believe they won the same chunk. None of these
 raise, and none of them look different from "the simulation is just
 slow" on the map. They each have a named check below.
+
+New-reader primer: this whole module is a diagnostics add-on, entirely
+separate from the simulation itself -- delete this file and every other
+module still runs unchanged. `attach(model)` works by MONKEY-PATCHING:
+it wraps `model.step` (and the allocator's `allocate`) with thin
+before/after hooks (see `_wrap` below) that record timing and take a
+snapshot, without touching a single line of model.py or robot.py. That
+is why it can be bolted onto any model instance from the GUI or a
+one-off script without editing the simulation code at all.
 """
 
 from __future__ import annotations
@@ -197,9 +206,29 @@ class DebugMonitor:
 
     def accuracy_summary(self) -> dict:
         """bid == uncontended execution is the invariant costs.py is built
-        around; this is the measured version of it. Ratios below 1.0 mean
-        the bid OVER-charged, above 1.0 that execution cost more than the
-        bid promised (contention, re-routes, hazards)."""
+        around; this is the measured version of it.
+
+        MATH: for each completed task, a ratio of what it ACTUALLY cost
+        against what its bid PROMISED:
+
+            tau_ratio = actual ticks  / predicted tau_ij
+            e_ratio   = actual energy / predicted E_ij
+
+        Ratios below 1.0 mean the bid OVER-charged, above 1.0 that
+        execution cost more than the bid promised (contention, re-routes,
+        hazards). Mean, max AND min are all reported: a bid that came in
+        UNDER cost breaks the invariant in the direction nobody checks,
+        and mean+max alone hid an x0.77 outlier completely.
+
+        `n_reshared` counts tasks whose sharer count changed between bid
+        and execution -- the MOA-CBBA-specific source of drift, since a
+        bid priced for V/2 executed at V/3 will not match.
+
+        Predictions are recorded at assignment time by _on_assign and
+        closed out by _on_finish.
+
+        CALLED BY: the GUI's debug panel, and snapshot_text.
+        """
         if not self.accuracy:
             return {}
         taus = [a["tau_ratio"] for a in self.accuracy if a["tau_ratio"]]
@@ -227,6 +256,30 @@ class DebugMonitor:
     # invariant checks — recomputed every tick, cheap by design
     # ---------------------------------------------------------------- #
     def run_checks(self) -> list[tuple[int, str]]:
+        """Re-verify every invariant against the CURRENT model state and
+        return a list of (level, message) for each violation.
+
+        Recomputed from scratch each tick rather than accumulated, so the
+        list always describes what is wrong RIGHT NOW. Empty means the
+        simulation is internally consistent.
+
+        THE INVARIANTS CHECKED (numbered inline below):
+          1. BAM consistency, both directions -- every seat on a task
+             points at a robot that is actually working it, and every
+             working robot holds a seat. Violations strand a task
+             permanently.
+          2. One robot per cell, the physics rule robot.py guarantees.
+          3. Conservation of soil: ground + hoppers + delivered is
+             constant. Any drift means volume was created or destroyed.
+          4. Progress -- has anything changed in STALL_TICKS ticks?
+          5. Idle robots while reachable work exists (allocator stuck).
+          6. Robots in TO_TASK with an empty planned path (mover stuck).
+          7. Allocator disagreement -- two robots believing they won the
+             same task.
+
+        CALLED BY: on_tick_end, which is invoked by the wrapper attach()
+        installs around model.step.
+        """
         m = self.model
         out: list[tuple[int, str]] = []
         add = out.append
@@ -796,7 +849,28 @@ def _wrap(obj, name: str, before=None, after=None) -> bool:
 
 
 def attach(model, max_events: int = 800) -> DebugMonitor:
-    """Attach (once) and return the monitor. Safe to call every frame."""
+    """Attach (once) and return the monitor. Safe to call every frame.
+
+    HOW IT WORKS -- monkey-patching, not inheritance. It wraps BOUND
+    METHODS on this model instance (via _wrap) with before/after hooks:
+
+        model.step            -> time it, snapshot robots, run checks
+        model.allocator.allocate -> time it, note non-convergence
+        model.dynamics.step   -> log hazard/obstacle/weather events
+        each robot's assign / _finish_task / abandon_task / _reroute /
+            _plan_leg / _go_dump -> record events and bid predictions
+
+    Nothing in excavsim needs to know this exists, a fresh model (GUI
+    Reset, batch_run) is simply attached again, and because the monitor
+    consumes no RNG draws a monitored run is bit-identical to an
+    unmonitored one.
+
+    IDEMPOTENT: returns the existing monitor if one is already attached,
+    and _wrap refuses to double-wrap, so calling this every GUI frame is
+    safe.
+
+    CALLED BY: app.py's panels, and debug.main for headless runs.
+    """
     existing = getattr(model, "_debug", None)
     if existing is not None:
         return existing

@@ -1,3 +1,12 @@
+"""excavsim: the multi-robot excavation simulation package.
+
+Re-exports the pieces most callers need (ExcavationModel, ExcavatorRobot,
+the cost/bidding functions, the three allocators) so scripts can write
+`from excavsim import ExcavationModel` instead of reaching into
+individual submodules. See the package README.md and DOCUMENTATION.md
+at the repo root for an overview of how the pieces fit together.
+"""
+
 from .bidding import Stage, bid_value, leg_cost, residual_cost
 from .comms import CommNetwork, Message
 from .costs import RobotSpec, energy_ij, n_trips, objective, tau_ij

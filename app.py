@@ -25,6 +25,18 @@ Page 2 answer the second question:
     its bid promised.
 All of it is read-only: excavsim.debug consumes no RNG, so a run with
 the dashboard open is bit-identical to a headless batch run.
+
+New-reader primer: this file only draws pictures and tables of a model
+that already exists (built by excavsim/model.py) -- it contains no
+simulation logic of its own. It's built on Mesa's SolaraViz framework
+plus matplotlib for the map. Skim order if you're new to it: `page =
+SolaraViz(...)` near the bottom wires everything together (which
+components go on which tab); `model_params` right above it defines the
+sliders/dropdowns shown in the sidebar (their keys must match
+ExcavationModel's constructor arguments — see model.py); the `_draw_*`
+functions each paint one optional overlay onto the map (robot paths,
+sensor discs, hazards, ...); and `agent_portrayal`/`layer_portrayal`
+tell Mesa's renderer how to colour robots/tasks/property layers.
 """
 
 import matplotlib.patheffects as patheffects
@@ -125,6 +137,15 @@ def _next_task(r):
 
 
 def agent_portrayal(agent):
+    """Tell Mesa's renderer how to draw one agent on the map.
+
+    Two kinds exist: TaskMarker (a yellow square, the excavation site)
+    and ExcavatorRobot (a circle coloured by its current Stage, per
+    STAGE_COLORS above -- grey idle, orange travelling, red digging, blue
+    hauling, purple unloading). zorder puts robots on top of tasks.
+
+    CALLED BY: Mesa's SpaceRenderer, once per agent per redraw.
+    """
     if isinstance(agent, TaskMarker):
         return AgentPortrayalStyle(color="#f1c40f", marker="s", size=90,
                                    zorder=2, edgecolors="black",
@@ -135,6 +156,18 @@ def agent_portrayal(agent):
 
 
 def layer_portrayal(layer):
+    """Tell Mesa's renderer how to shade a property layer, or None to
+    hide it.
+
+    The model carries three layers (terrain, soil_volume, elevation) but
+    only ONE is drawn at a time -- whichever the `show_layer` dropdown
+    currently selects; every other layer returns None. Terrain uses the
+    discrete Fig. 1 palette (vmin/vmax pinned to 0..4 so colours map to
+    Terrain enum values regardless of what is on screen); elevation uses
+    a continuous colormap with a colorbar.
+
+    CALLED BY: Mesa's SpaceRenderer, once per layer per redraw.
+    """
     if layer.name != show_layer.value:
         return None
     if layer.name == "terrain":
@@ -148,6 +181,15 @@ def layer_portrayal(layer):
 # Fig. 1 right panel: metrics, robot list, task list (live tables)
 # ------------------------------------------------------------------ #
 def robot_frame(model) -> pd.DataFrame:
+    """One row per robot for the live side-panel table: class, stage,
+    position, current/next task, battery %, payload, energy, idle ticks
+    and tasks completed.
+
+    Rebuilt from scratch on every redraw -- cheap at fleet sizes of a
+    dozen, and it cannot go stale.
+
+    CALLED BY: the SidePanel component.
+    """
     rows = []
     for i, r in enumerate(model.robots):
         rows.append({
@@ -167,6 +209,17 @@ def robot_frame(model) -> pd.DataFrame:
 
 
 def task_frame(model) -> pd.DataFrame:
+    """One row per task for the live side-panel table: cell, remaining
+    vs. original volume, which robots hold seats, and a status string.
+
+    The status distinguishes four states worth telling apart: pending
+    (nobody on it), "k robot(s)" (being worked), "finishing" (volume
+    gone but material still in transit) and "done @ tick" (stamped
+    complete). That third state is exactly the gap between Task.done and
+    TaskRegistry.all_done described in tasks.py.
+
+    CALLED BY: the SidePanel component.
+    """
     rows = []
     for t in model.tasks.all:
         if t.done and t.completed_tick is not None:

@@ -18,6 +18,17 @@ Energy is accounted in three buckets (travel / climb / dig) as well as
 in the total, because "large robots burn more" and "large robots are
 sent uphill more" are different findings and the total cannot tell them
 apart. The GUI inspector reads these.
+
+New-reader primer: this is the file where the simulation actually
+HAPPENS, tick by tick. Every other module either describes the world
+(terrain.py, tasks.py), computes numbers ahead of time (costs.py,
+bidding.py) or decides WHO gets WHAT task (allocation.py, CBPAE.py,
+MOACBBA.py) -- this file is where a robot that has been assigned a task
+carries it out: drive to the dig site, dig until the hopper is full or
+the task is empty, drive to the dump, unload, and repeat. `step()`
+(search for "def step" below) is the entry point Mesa calls on every
+robot every tick; everything else is a helper it calls into. The Stage
+enum (bidding.py) names which phase of that loop a robot is currently in.
 """
 
 
@@ -105,7 +116,14 @@ AVOID_ROBOTS_WHEN_PLANNING = True
 
 
 class ExcavatorRobot(CellAgent):
-    """One excavation robot. `model` is an ExcavationModel."""
+    """One excavation robot. `model` is an ExcavationModel.
+
+    CellAgent is Mesa's base class for an agent that lives on a
+    grid cell (`self.cell`) and gets its `step()` method called once per
+    tick by the model's scheduler. Subclassing it is what makes this
+    object show up on the map and get simulated automatically -- see
+    model.py's `self.agents.shuffle_do("step")`.
+    """
 
     def __init__(self, model, cell, spec: RobotSpec):
         super().__init__(model)
@@ -170,25 +188,60 @@ class ExcavatorRobot(CellAgent):
     # communication (Phase 6): thin wrappers over the model's network
     # ------------------------------------------------------------------ #
     def send(self, payload: dict, to=None) -> None:
-        """Queue a message; to=None broadcasts to robots in range."""
+        """Queue a message; to=None broadcasts to robots in range.
+
+        Thin wrapper so allocator code reads `robot.send(...)` rather
+        than reaching through to the network object. Nothing is
+        delivered until comms.flush_and_deliver runs.
+
+        CALLED BY: every allocator's broadcast() -- CBBAAgent.broadcast,
+        CBPAEAgent.broadcast, MOACBBAAgent.broadcast.
+        """
         self.model.comms.send(self, payload, to)
 
     def receive_all(self):
-        """Drain this robot's inbox (list of Message, FIFO)."""
+        """Drain this robot's inbox (list of Message, FIFO).
+
+        CALLED BY: each allocator's consensus step, and also once before
+        an auction begins to discard stale messages from earlier ticks.
+        """
         return self.model.comms.receive_all(self)
 
     # ------------------------------------------------------------------ #
     # assignment interface used by allocators (writes the BAM row x_i)
     # ------------------------------------------------------------------ #
     def assign(self, task_id: int) -> bool:
-        """Take task j. Returns False (no state change) if no dig
-        position OR no dump position is reachable; allocators should
-        then skip the task.
+        """Take task j -- THE handover point from allocator to physics.
 
-        Work cells claimed by other robots are excluded: with task
-        decomposition, sibling chunks share a cell l_j, so without this
-        two sharers pick the same p*, collide, and burn STUCK_LIMIT
-        ticks each before _reroute untangles them."""
+        This is the only place a robot commits to a task, and the only
+        place x_ij goes from 0 to 1. Every allocator ends its auction by
+        calling it.
+
+        WHAT IT DOES:
+          1. Refuse outright if the task is finished or this robot is
+             already seated on it.
+          2. Choose p* (`work_cell`), the dig position: the nearest cell
+             adjacent to the task that this robot can reach, EXCLUDING
+             cells other robots have already committed to. When sharing,
+             two robots picking the same p* would simply collide.
+          3. Choose q* (`dump_cell`), the unload position, measured from
+             p* rather than from here -- it is the cell the robot will
+             shuttle back to on every haul.
+          4. Commit: record the task, take a seat, switch to stage
+             TO_TASK and plan the first leg.
+
+        RETURNS False, with NO state changed, when either p* or q* is
+        unreachable. Allocators must check the return value and drop the
+        task from their bundle when it is False -- otherwise they keep a
+        claim on a task this robot has proved it cannot execute, and no
+        other robot can bid on it.
+
+        Note steps 2 and 3 mirror the two legs bidding.leg_cost prices,
+        which is what keeps the executed route consistent with the bid.
+
+        CALLED BY: GreedyAllocator.allocate, CBBAAllocator.allocate,
+        CBPAEAgent.tryAssign, MOACBBAAllocator._execute.
+        """
         task = self.model.tasks.get(task_id)
         if task.done or self.robot_id in task.assignees:
             return False
@@ -236,10 +289,19 @@ class ExcavatorRobot(CellAgent):
     def abandon_task(self) -> None:
         """Drop the current task and return it to the pool.
 
+        The PUBLIC name for a voluntary drop (allocator decided to give
+        this task up); _release_task is the shared implementation, also
+        reached by involuntary paths such as the stuck-too-long release.
+
         Das et al. Sec. 3.7.4: a robot may stop only during the FIRST
         phase of execution (travelling to the task), so that the task
         state is unchanged and the task stays reallocatable. Callers
-        must check `can_abandon` first."""
+        must check `can_abandon` first.
+
+        CALLED BY: CBPAEAgent._apply (Table 7 back-off),
+        CBPAEAgent.dropIfUnreachable / dropIfTooCostly, and
+        MOACBBAAllocator._execute (en-route switching).
+        """
         self._release_task()
 
     def _release_task(self) -> None:
@@ -252,7 +314,22 @@ class ExcavatorRobot(CellAgent):
         happened into the headline metric, inflates tasks_completed, and
         leaves CBPAE holding e = EXEC for a chunk nobody is working.
 
-        Anything that is not "the volume reached zero" ends here."""
+        Anything that is not "the volume reached zero" ends here.
+
+        MATH -- the conservation identity this protects:
+
+            soil in ground + soil in hoppers + soil at dumps = constant
+
+        Digging moves volume from the first term to the second; unloading
+        moves it from the second to the third. A robot leaving with a
+        non-empty hopper would delete its payload from all three, so the
+        guard below puts that volume BACK in the ground. debug.py checks
+        this identity every tick, and batch30.py reports it per run.
+
+        CALLED BY: abandon_task (voluntary), _wait_blocked (stuck past
+        UNREACHABLE_PATIENCE), _dig_tick (terrain turned out to be
+        undiggable) and _finish_task (safety net).
+        """
         if self.task_id is None:
             return
         task = self.model.tasks.get(self.task_id)
@@ -286,7 +363,20 @@ class ExcavatorRobot(CellAgent):
 
     @property
     def can_abandon(self) -> bool:
-        """Phase 1 of execution only, and nothing in the hopper."""
+        """May this robot legally drop its task right now?
+
+        Three conditions, all required: it HAS a task, it is still merely
+        TRAVELLING to it (stage TO_TASK), and its hopper is empty. That
+        is Das et al. Sec. 3.7.4's "first phase of execution only" rule,
+        and the reason is conservation: a robot that has not yet dug
+        anything has changed no task state, so the task can be handed to
+        someone else exactly as it was. Once digging starts, dropping
+        would either strand soil in a hopper or require putting it back.
+
+        CALLED BY: every drop path -- CBPAE's Table 7 back-off,
+        dropIfUnreachable, dropIfTooCostly, MOA-CBBA's en-route switch,
+        and _wait_blocked's stuck release.
+        """
         return (self.task_id is not None
                 and self.stage is Stage.TO_TASK
                 and self.payload <= 1e-9)
@@ -295,6 +385,11 @@ class ExcavatorRobot(CellAgent):
     # per-tick execution
     # ------------------------------------------------------------------ #
     def step(self) -> None:
+        """Called once per simulated tick by Mesa. Dispatches on the
+        current Stage: keep walking a planned route (TO_TASK / TO_DUMP),
+        remove one tick's worth of volume (DIG), or count down the fixed
+        unload time (UNLOAD). IDLE robots do nothing but tally idle time
+        -- they only start moving once an allocator calls `assign()`."""
         if self.stage is Stage.IDLE:
             self.idle_ticks += 1
             return
@@ -312,8 +407,13 @@ class ExcavatorRobot(CellAgent):
             self._unload_tick()
 
     def updateTaskList(self, taskList) -> None:
-        """Seed both allocators' task lists. Called from model.py once
-        the registry is populated."""
+        """Seed this robot's CBBA task list with the full task registry.
+
+        CALLED BY: model.ExcavationModel.__init__, once per robot, after
+        all tasks have been created. (During a run the allocators
+        overwrite `task_list` every auction with a filtered candidate
+        set, so this is only the initial population.)
+        """
         self.CBBA.task_list = list(taskList)
 
     # ------------------------------------------------------------------ #
@@ -325,14 +425,33 @@ class ExcavatorRobot(CellAgent):
     # ------------------------------------------------------------------ #
     @property
     def sensor_radius(self) -> float:
-        """Effective sensing range this tick: the spec's sigma_i degraded
-        by weather. Fog scales it to 0.4 and storm to 0.3, so a small
-        machine (sigma = 6) sees barely two cells in a storm while a
-        large one (sigma = 10) still sees three."""
+        """Effective sensing range this tick.
+
+        MATH:  radius = spec.sensor_range * dynamics.sensor_scale()
+
+        i.e. the robot's own sigma_i degraded by the current weather.
+        Fog scales it to 0.4 and storm to 0.3, so a small machine
+        (sigma = 6) sees barely two cells in a storm while a large one
+        (sigma = 10) still sees three.
+
+        READ BY: sense (which cells to examine), visible_robots and
+        _other_robot_cells (which machines can be planned around).
+        """
         return self.spec.sensor_range * self.model.dynamics.sensor_scale()
 
     def sense(self) -> None:
         """Update the occupancy memory from what is visible right now.
+
+        MATH -- the visible region is the DISC of radius r about the
+        robot: a cell (x, y) is examined when dx^2 + dy^2 <= r^2, scanned
+        over the bounding box [cx-r, cx+r] x [cy-r, cy+r]. Squared
+        distances are compared to avoid a square root per cell.
+
+        Sightings are stored as {cell: tick seen} and expire on two
+        different clocks, because the two hazard types age differently:
+        hazard zones sit still (MAP_TTL = 30 ticks) while obstacles
+        random-walk away (OBSTACLE_TTL = 3 ticks). See the constants at
+        the top of this file for the arithmetic behind those numbers.
 
         Two directions, and the second one matters as much as the first:
         cells inside the radius that are blocked get REMEMBERED, and
@@ -344,6 +463,10 @@ class ExcavatorRobot(CellAgent):
         Only DYNAMIC blockage is sensed. Bedrock and dump sites are
         surveyed before work starts, so they belong in the map, not in
         the sensor -- see known_blocked.
+
+        CALLED BY: model.step, for every robot, BEFORE the allocator
+        runs -- a bid priced on a stale map is a bid the robot cannot
+        execute.
         """
         if not getattr(self.model, "sensing_enabled", False):
             return
@@ -385,10 +508,25 @@ class ExcavatorRobot(CellAgent):
 
     def known_blocked(self) -> set[tuple[int, int]]:
         """What THIS robot believes is impassable: the surveyed map plus
-        whatever its sensor has found. Everything planned or bid on goes
-        through here rather than model.blocked_cells(), so a robot can
-        route straight into a hazard it has not seen yet -- and then
-        re-route when it comes into range, which is the whole point."""
+        whatever its sensor has found.
+
+        MATH:  static_blocked  U  sensed hazards  U  sensed obstacles
+
+        The static half (bedrock, dump blocks) is surveyed before work
+        starts and therefore known to everyone; the other two halves are
+        first-hand sightings only, since robots do not share maps.
+
+        This is the ROBOT'S BELIEF, deliberately distinct from the
+        model's ground truth (model.blocked_cells). Everything planned or
+        bid on goes through here, so a robot can route straight into a
+        hazard it has not seen yet -- and then re-route when it comes
+        into range, which is the whole point of Phase 3. With
+        sensing_enabled=False it falls back to omniscience.
+
+        CALLED BY: assign, _plan_leg, _reroute, _go_dump, _wait_blocked,
+        and (crucially) bidding.leg_cost -- so bids are priced on the
+        same information execution will use.
+        """
         if not getattr(self.model, "sensing_enabled", False):
             return self.model.blocked_cells()
         return (self.model._static_blocked() | self._map.keys()
@@ -435,6 +573,12 @@ class ExcavatorRobot(CellAgent):
     def visible_robots(self) -> list:
         """Other robots this one can currently SEE.
 
+        MATH: same disc test as sense() -- robot r is visible when
+        (ox-cx)^2 + (oy-cy)^2 <= sensor_radius^2, compared squared to
+        avoid a square root.
+
+        CALLED BY: _other_robot_cells, which feeds route planning.
+
         Positions are sensed, never remembered: a robot moves every tick,
         so a sighting from ten ticks ago is worse than no information at
         all -- it would have the planner routing around a machine that
@@ -456,7 +600,11 @@ class ExcavatorRobot(CellAgent):
 
     def _other_robot_cells(self) -> set[tuple[int, int]]:
         """For PLANNING: only robots in sensor range. A robot cannot steer
-        around a machine it has no way of knowing is there."""
+        around a machine it has no way of knowing is there.
+
+        CALLED BY: _plan_leg (as a soft preference) and _wait_blocked
+        (when handing a sensed obstacle set to _reroute).
+        """
         return {r.cell.coordinate for r in self.visible_robots()}
 
     def _all_robot_cells(self) -> set[tuple[int, int]]:
@@ -464,7 +612,11 @@ class ExcavatorRobot(CellAgent):
         occupy one cell regardless of who noticed whom -- not seeing
         something is not permission to drive through it. The gap between
         this and _other_robot_cells is exactly where unseen robots cause
-        real waits instead of tidy detours."""
+        real waits instead of tidy detours.
+
+        CALLED BY: _advance_along_path, to decide what actually stops the
+        wheels this tick.
+        """
         return {r.cell.coordinate for r in self.model.robots if r is not self}
 
     def _plan_leg(self, dest: tuple[int, int],
@@ -484,7 +636,18 @@ class ExcavatorRobot(CellAgent):
 
         Preferences are dropped weakest-evidence-first: the halo goes
         before the robots do, because a machine is standing there NOW
-        whereas the halo is a guess about the next tick.
+        whereas the halo is a guess about the next tick. Concretely it
+        runs A* up to three times, on progressively smaller blocked sets:
+
+            hard | soft | halo   ->   hard | soft   ->   hard
+
+        stopping at the first that yields a route (identical tiers are
+        skipped). The resulting cell list is stored in self._path and
+        walked one tick at a time by _advance_along_path.
+
+        CALLED BY: assign (first leg to p*), _go_dump (leg to q*),
+        _unload_tick (return leg to p*), _dig_tick (re-plan after drift)
+        and _reroute (recovery after being stuck).
         """
         self._dest = dest
         hard = self.known_blocked()
@@ -519,8 +682,26 @@ class ExcavatorRobot(CellAgent):
         self._stuck = 0
 
     def _advance_along_path(self) -> bool:
-        """Move up to v_max cells; never enter an occupied cell.
+        """Move up to v_max cells along the planned route this tick.
         Returns True once the destination is REACHED.
+
+        MATH -- fractional speeds via a movement credit. v_max is in
+        cells per tick and need not be an integer (0.8 for a large
+        machine, 1.2 for a small one), so each tick adds v_max to
+        `_move_credit` and the robot takes one step per whole unit of
+        credit, carrying the remainder forward:
+
+            credit += v_max
+            while credit >= 1 and path remains:  step; credit -= 1
+
+        Over many ticks this yields exactly v_max cells per tick on
+        average, which is what makes the closed-form d / v_max in
+        costs.tau_ij correct. The credit is deliberately NOT reset by
+        re-planning (see _plan_leg), only forfeited by being blocked
+        (_wait_blocked) -- a robot that could not move banked nothing.
+
+        Each completed step charges energy through _spend_move, which is
+        the execution-side mirror of costs.energy_ij's ALPHA/GAMMA terms.
 
         Arrival is `we are standing on _dest`, not `the path list is
         empty`. Those are different whenever _plan_leg failed, and
@@ -573,6 +754,22 @@ class ExcavatorRobot(CellAgent):
         which is omniscience smuggled in through the recovery path. The
         machine that just blocked us is adjacent and therefore inside the
         sensor disc anyway, so nothing needed is lost.
+
+        TWO ESCALATING COUNTERS:
+          _stuck   -- consecutive blocked ticks; at STUCK_LIMIT (2) it
+                      triggers a _reroute around whatever is in the way.
+          _waiting -- consecutive ticks of no progress; at
+                      UNREACHABLE_PATIENCE (20) the robot gives the task
+                      back entirely, provided it may legally do so.
+        Both reset to 0 the moment a step succeeds.
+
+        The patience release exists at this physics layer rather than in
+        an allocator because CBBA has no drop path of its own, so a robot
+        walled off from its target would otherwise hold the reservation
+        for the rest of the run.
+
+        CALLED BY: _advance_along_path, whenever a tick produces no
+        movement (blocked next cell, or no route at all).
         """
         self._move_credit = 0.0
         self._stuck += 1
@@ -592,7 +789,16 @@ class ExcavatorRobot(CellAgent):
     def _reroute(self, occupied: set[tuple[int, int]]) -> None:
         """Stuck: pick a fresh, currently-free work/dump cell for the
         same target and route around parked robots. Falls back to
-        keeping the old destination if no free alternative exists."""
+        keeping the old destination if no free alternative exists.
+
+        Note it re-picks the DESTINATION, not just the route: if another
+        robot is parked on this robot's chosen p*, no amount of
+        re-routing helps, but one of the up-to-nine other cells adjacent
+        to the same task usually works. Which cell is re-chosen depends
+        on the current stage -- p* while TO_TASK, q* while TO_DUMP.
+
+        CALLED BY: _wait_blocked, once _stuck reaches STUCK_LIMIT.
+        """
         if self.stage is Stage.TO_TASK and self.task_id is not None:
             task = self.model.tasks.get(self.task_id)
             found = nearest_work_cell(self.cell.coordinate, [task.cell],
@@ -616,6 +822,37 @@ class ExcavatorRobot(CellAgent):
         # a failed robot-avoiding search already retries without them.
 
     def _dig_tick(self) -> None:
+        """One tick of excavation: remove some volume, charge energy, and
+        leave for the dump when the hopper is full or the pile is empty.
+
+        MATH -- volume removed this tick:
+
+            dv = min( rho_i / H,                 nominal dig rate
+                      task.remaining,            can't dig more than is there
+                      C_i - payload )            can't overfill the hopper
+
+        The first term is where hardness bites: dig_rate rho_i is volume
+        per (hardness x tick), so rock (H = 3.5) yields 3.5x less per
+        tick than soil. Summed over a whole task that reproduces exactly
+        the V*H/rho dig time in costs.tau_ij.
+
+        ENERGY: a dig tick always costs exactly BETA, a constant. That
+        falls out of the cost model -- see the BETA note in costs.py --
+        and is what lets the incremental simulation match the closed form
+        with no drift.
+
+        Volume is decremented in TWO places, deliberately: task.remaining
+        (the logical job) and grid.soil_volume (the visual/physical
+        layer). They must move together or the conservation check in
+        debug.py fires.
+
+        EARLY EXITS: if the robot has drifted out of range it re-plans;
+        if the task is already empty it hauls or finishes; if the terrain
+        turns out to be undiggable it hauls what it has and gives the
+        task back unfinished.
+
+        CALLED BY: step, every tick the robot is in stage DIG.
+        """
         task = self.model.tasks.get(self.task_id)
         coord = task.cell
         if chebyshev(self.cell.coordinate, coord) > 1:  # drifted? re-plan
@@ -644,6 +881,18 @@ class ExcavatorRobot(CellAgent):
             self._go_dump()
 
     def _go_dump(self) -> None:
+        """Switch to hauling: set stage TO_DUMP and plan the leg to q*.
+
+        q* is normally chosen once, at assignment time, and reused for
+        every trip -- the robot shuttles between the same p* and q*. It
+        is only re-picked here if it was never set.
+
+        A robot with soil aboard and NO reachable dump WAITS rather than
+        dropping the task: a loaded machine cannot abandon its load
+        without deleting the soil. See the long comment inline below.
+
+        CALLED BY: _dig_tick, when the hopper fills or the pile empties.
+        """
         if self.dump_cell is None:  # q* chosen once per task, from p*
             found = self.model.dump_work_cell(
                 self.work_cell, blocked=self.known_blocked())
@@ -673,6 +922,21 @@ class ExcavatorRobot(CellAgent):
         self._plan_leg(self.dump_cell)
 
     def _unload_tick(self) -> None:
+        """Count down the fixed unload time; on the last tick, empty the
+        hopper and decide what to do next.
+
+        MATH: unloading takes exactly T_UNLOAD ticks per trip (a constant
+        from terrain.py, 3 by default), which is the n * T_UNLOAD term of
+        costs.tau_ij. E_unload = 0 by assumption, so no energy is charged
+        here.
+
+        On completion the payload becomes `soil_delivered` -- the third
+        term of the conservation identity (ground + hoppers + dumps).
+        Then either the task is finished, or the robot heads back to the
+        SAME p* for another load.
+
+        CALLED BY: step, every tick the robot is in stage UNLOAD.
+        """
         self._unload_left -= 1
         if self._unload_left > 0:
             return
@@ -704,13 +968,32 @@ class ExcavatorRobot(CellAgent):
         genuinely delivered. Call this AFTER drop_assignee, from every
         exit path, or a task whose last robot leaves through the
         unreachable-dump route never gets stamped and the run never
-        terminates."""
+        terminates.
+
+        The stamp it writes, completed_tick, is what model.makespan reads
+        and what TaskRegistry.all_done tests, so this method effectively
+        decides when the simulation is allowed to end.
+
+        CALLED BY: _finish_task and _release_task -- i.e. every path by
+        which a robot lets go of a task.
+        """
         if task.done and not task.assignees and task.completed_tick is None:
             task.completed_tick = self.model.tick
 
     def _finish_task(self) -> None:
         """This robot is done with the task. The TASK is done only when
-        the last sharer says so -- see _stamp_if_complete."""
+        the last sharer says so -- see _stamp_if_complete.
+
+        Frees the seat, possibly stamps the task complete, and returns
+        the robot to IDLE so the next auction can give it new work
+        (Algorithm 1 line 11: x_ij <- 0).
+
+        Contrast _release_task, which handles giving a task up UNFINISHED
+        and does not stamp a completion.
+
+        CALLED BY: _dig_tick (arrived to find the pile already empty) and
+        _unload_tick (delivered the final load).
+        """
         task = self.model.tasks.get(self.task_id)
         if not task.done:
             # Safety net for any future call site that gets this wrong:
@@ -730,8 +1013,26 @@ class ExcavatorRobot(CellAgent):
     # energy
     # ------------------------------------------------------------------ #
     def _spend_move(self, frm, to) -> None:
-        """Only elevation GAINED costs energy (descent is free), and
-        climbing loaded costs FULL_PAYLOAD_GAMMA times more."""
+        """Charge the energy for ONE completed grid step.
+
+        MATH -- the execution-side mirror of costs.energy_ij's travel and
+        climb terms:
+
+            E_step = ALPHA                                   (flat travel)
+                   + GAMMA * gain * traction * loaded_factor (if uphill)
+
+        where gain = elevation[to] - elevation[frm], charged only when
+        positive (descent is free), and loaded_factor is
+        FULL_PAYLOAD_GAMMA (1.6) when the hopper is non-empty, else 1.0.
+        `traction` is the current weather multiplier.
+
+        Summed over a whole leg this reproduces exactly the
+        ALPHA*d + GAMMA*traction*climb terms the bid predicted -- which
+        is the bid == execution invariant, and why path_climb sums only
+        positive deltas and applies FULL_PAYLOAD_GAMMA to the loaded legs.
+
+        CALLED BY: _advance_along_path, once per cell entered.
+        """
         self.distance_travelled += 1.0
         self._spend(ALPHA, "travel")
         elev = self.model.grid.elevation.data
@@ -746,7 +1047,24 @@ class ExcavatorRobot(CellAgent):
     def _spend(self, amount: float, kind: str = "travel") -> None:
         """Single point where energy leaves the battery, so the Phase 2
         drain multiplier is applied once and cannot drift out of sync
-        with energy_ij (which also scales its whole return value)."""
+        with energy_ij (which also scales its whole return value).
+
+        MATH:  charged = amount * spec.drain_scale
+
+        applied once here, exactly as costs.energy_ij applies it once to
+        its whole return value. Heavy machines have drain_scale 1.4, so
+        the same physical action costs them 40% more.
+
+        The `kind` argument splits the charge into three reporting
+        buckets (travel / climb / dig) as well as the total, because
+        "large robots burn more" and "large robots are sent uphill more"
+        are different findings the total cannot distinguish.
+
+        Battery is floored at 0.0 -- a flat battery does not currently
+        stop a robot, it just stops the number going negative.
+
+        CALLED BY: _spend_move (travel and climb) and _dig_tick (dig).
+        """
         amount *= self.spec.drain_scale
         self.energy_used += amount
         if kind == "climb":
