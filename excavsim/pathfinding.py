@@ -21,6 +21,34 @@ Coord = tuple[int, int]
 
 MOORE = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
+# Forbid a diagonal step when BOTH of the orthogonal cells it passes
+# between are blocked.
+#
+# On an 8-connected grid a move from (x, y) to (x+1, y+1) touches the
+# corner shared by (x+1, y) and (x, y+1). If both of those are solid,
+# the robot is squeezing through a zero-width gap between two rocks --
+# geometrically impossible for anything with a body, and it makes walls
+# leak. _scatter_bedrock draws ridges along (1, 1) and (1, -1) as well
+# as the axes, so a diagonal ridge is a STAIRCASE of diagonally-touching
+# cells: every step of it had a gap, and a ridge that looks like a solid
+# wall on screen stopped nothing.
+#
+# "Both blocked" is the minimum rule and the one implemented. The
+# stricter "either blocked" (no corner-cutting, appropriate for a
+# vehicle with real width) would also forbid clipping the outside corner
+# of a single rock; it is a larger behavioural change and can make tight
+# work cells unreachable, so it is left as a note rather than a default.
+NO_DIAGONAL_SQUEEZE = True
+
+
+def _squeezes(cur: Coord, dx: int, dy: int, blocked: set[Coord]) -> bool:
+    """True if stepping (dx, dy) from `cur` cuts between two blocked
+    cells. Orthogonal moves never do."""
+    if not (dx and dy):
+        return False
+    return ((cur[0] + dx, cur[1]) in blocked
+            and (cur[0], cur[1] + dy) in blocked)
+
 
 def chebyshev(a: Coord, b: Coord) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
@@ -67,6 +95,12 @@ def astar(
             if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
                 continue
             if nxt in blocked and nxt not in goals:
+                continue
+            # Applied even when the destination is a goal: a work cell
+            # that can only be reached by passing through a wall is not
+            # reachable, and pretending otherwise produces a bid the
+            # robot can never execute.
+            if NO_DIAGONAL_SQUEEZE and _squeezes(cur, dx, dy, blocked):
                 continue
             ng = g[cur] + 1.0
             if ng < g.get(nxt, float("inf")):

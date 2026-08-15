@@ -24,7 +24,8 @@ _register_moacbba()
 from .comms import CommNetwork
 from .costs import RobotSpec, objective
 from .fleet import ROBOT_CLASSES, build_fleet, fleet_summary
-from .pathfinding import nearest_work_cell, nearest_work_path, work_candidates
+from .pathfinding import (_squeezes, nearest_work_cell, nearest_work_path,
+                          work_candidates)
 from .robot import ExcavatorRobot
 from .tasks import TaskRegistry
 from .terrain import T_UNLOAD, Terrain
@@ -481,17 +482,31 @@ class ExcavationModel(Model):
                 if self.grid.terrain.data[x, y] != rock]
         if not free:
             return False
+        # The flood fill MUST use the same connectivity rule as A*, or it
+        # accepts ridges that look connected to it and are impassable to
+        # a robot. Before the no-squeeze rule the two agreed by accident;
+        # now the fill has to refuse diagonal steps between two rocks
+        # exactly as the planner does, or _scatter_bedrock will happily
+        # commit a ridge that severs the map.
+        solid = {(x, y) for x in range(w) for y in range(h)
+                 if self.grid.terrain.data[x, y] == rock}
         seen = {free[0]}
         stack = [free[0]]
         while stack:
             cx, cy = stack.pop()
             for ddx in (-1, 0, 1):
                 for ddy in (-1, 0, 1):
+                    if ddx == ddy == 0:
+                        continue
                     n = (cx + ddx, cy + ddy)
-                    if (0 <= n[0] < w and 0 <= n[1] < h and n not in seen
-                            and self.grid.terrain.data[n[0], n[1]] != rock):
-                        seen.add(n)
-                        stack.append(n)
+                    if not (0 <= n[0] < w and 0 <= n[1] < h):
+                        continue
+                    if n in seen or n in solid:
+                        continue
+                    if _squeezes((cx, cy), ddx, ddy, solid):
+                        continue
+                    seen.add(n)
+                    stack.append(n)
         return len(seen) == len(free)
 
     def _scatter_elevation(self, octaves: int, persistence: float, height_scale: float) -> None:
