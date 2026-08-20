@@ -74,8 +74,11 @@ def leg_cost(model, robot, task, startPos=None,
     if cache is not None and key in cache:
         return cache[key]
 
+    # The ROBOT's map, not the model's: a bid must be priced on the same
+    # information the robot will actually execute against.
+    known = robot.known_blocked()
     dig = nearest_work_path(start, [coord], model.grid.width,
-                            model.grid.height, model.blocked_cells())
+                            model.grid.height, known)
     if dig is None:
         if cache is not None:
             cache[key] = (INF, INF, None)
@@ -135,13 +138,13 @@ def residual_cost(model, robot) -> tuple[float, float]:
     if robot.stage is Stage.TO_TASK and robot.work_cell is not None:
         p = astar(robot.cell.coordinate, robot.work_cell,
                   model.grid.width, model.grid.height,
-                  model.blocked_cells())
+                  robot.known_blocked())
         d_to_work = float(len(p) - 1) if p else 0.0
 
     d_dump = 0.0
     if robot.work_cell is not None and robot.dump_cell is not None:
         p = astar(robot.work_cell, robot.dump_cell, model.grid.width,
-                  model.grid.height, model.blocked_cells())
+                  model.grid.height, robot.known_blocked())
         d_dump = float(len(p) - 1) if p else 0.0
 
     t_dig = task.remaining * h / spec.dig_rate

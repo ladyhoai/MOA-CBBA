@@ -87,6 +87,12 @@ class ExcavationModel(Model):
         # grid the network is a genuine multi-hop mesh and consensus
         # becomes the thing being compared. None restores the old
         # complete-graph behaviour.
+        # Phase 3 sensing. False = the old omniscient behaviour, where
+        # every robot sees every hazard the tick it appears. True makes a
+        # robot plan against what its OWN sensor has found, so sigma_i
+        # (a dead RobotSpec field until now) and the weather sensor_scale
+        # (computed and only ever displayed) both start doing work.
+        sensing_enabled: bool = True,
         comm_range: float | None = 10.0,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
@@ -136,6 +142,7 @@ class ExcavationModel(Model):
     ):
         super().__init__(rng=int(seed) if seed is not None else None)
         self.w1, self.w2 = w1, w2
+        self.sensing_enabled = bool(sensing_enabled)
         self.t_unload = T_UNLOAD
         self.tick = 0
         # Largest CBBA bundle any robot has held this run. Cheap, and
@@ -275,6 +282,12 @@ class ExcavationModel(Model):
         self.tick += 1
         self.dynamics.step(self.tick)
         self.comms.flush_and_deliver(self.tick)    # in-flight messages land
+
+        # Sense BEFORE bidding: a bid priced on a stale occupancy map is
+        # a bid the robot cannot execute, which breaks the
+        # bid == execution invariant the whole cost model rests on.
+        for r in self.robots:
+            r.sense()
 
         self._leg_cache = {}                       # fresh per tick
         self.allocator.allocate(self)              # bidding + consensus
