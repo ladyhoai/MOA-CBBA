@@ -39,6 +39,18 @@ Domain notes (record these in the report as deliberate scope choices):
 
 Bid convention: LOWER IS BETTER (Sec. 3.1). Tables 5 and 6 are written
 as b_k < b_n, so transcribing them faithfully requires it.
+
+New-reader primer: CBPAE's headline idea, and its main difference from
+CBBA, is that a robot doesn't wait until it's idle to look for its next
+job -- it bids on a NEXT task while still finishing its CURRENT one, and
+that bid gets cheaper (more competitive) every round as the current task
+gets closer to done (`residual_cost` in bidding.py is what shrinks). The
+five per-task fields tracked in CBPAEAgent (bid value B, who holds it A,
+bid time TB, drop time TD, execution status E) are exactly what the
+paper calls the task vectors; `_bidTaskRule` / `_otherTaskRule` /
+`_parallelExecutionRule` are its consensus Tables 5/6/7 -- the rules two
+robots use to agree on the outcome after hearing from each other, the
+same role Table I plays for CBBA in allocation.py.
 """
 
 from __future__ import annotations
@@ -116,14 +128,40 @@ class CBPAEAgent:
     # Sec. 3.7.1: bidding
     # -------------------------------------------------------------- #
     def freeTasks(self, model) -> list:
-        """FT, Eq. (8): tasks whose execution status is NALC or DROP."""
+        """FT, Eq. (8): tasks I believe are available to bid on.
+
+        MATH:  FT = { t : not done AND e_t in {NALC, DROP} }
+
+        i.e. unfinished tasks whose execution status is "not allocated
+        yet" or "was allocated but dropped". Tasks I believe are EXEC
+        (someone is digging) or FNSH (finished) are excluded.
+
+        Note this filters on BELIEF (my E vector), not on ground truth --
+        which is the whole point of a decentralised algorithm, and also
+        why _reconcile exists to repair beliefs that have gone wrong in
+        the same way on every robot.
+
+        CALLED BY: biddableTasks.
+        """
         return [t for t in model.tasks.all
                 if not t.done and self._status(t.task_id) in (NALC, DROP)]
 
     def biddableTasks(self, model, robot) -> list:
-        """BT, Eq. (9). The priority filter (l_j <= L_FT) is a no-op in
-        this domain and beta_nj == 1 for every pair, so the only real
-        constraint left is reachability."""
+        """BT, Eq. (9): the free tasks this robot can actually reach,
+        each with its priced (tau, E).
+
+        MATH: BT = { (t, tau, E) : t in FT and t is reachable }, where
+        tau/E come from bidding.leg_cost priced FROM the position this
+        robot will be in when it can start (see _bidStartPosition).
+
+        In the original paper Eq. (9) also filters on task priority
+        (l_j <= L_FT) and robot skill (beta_nj), but excavation has no
+        priorities and every robot has the single "excavate" skill, so
+        both collapse to no-ops and reachability is the only real
+        constraint left.
+
+        CALLED BY: computeBid.
+        """
         out = []
         startPos = self._bidStartPosition(robot)
         for t in self.freeTasks(model):
@@ -135,20 +173,49 @@ class CBPAEAgent:
     @staticmethod
     def _bidStartPosition(robot):
         """Where the robot will be when it can start the next task: at
-        its dump site if it is mid-task, otherwise where it stands."""
+        its dump site if it is mid-task, otherwise where it stands.
+
+        This is what makes bid-while-executing physically honest. A robot
+        mid-task will finish at its dump cell q*, so the NEXT task's
+        approach leg must be measured from there, not from where the
+        robot happens to be standing right now.
+
+        CALLED BY: biddableTasks.
+        """
         if robot.task_id is not None and robot.dump_cell is not None:
             return robot.dump_cell
         return None
 
     def computeBid(self, model, robot, now: int):
-        """One iteration of Fig. 2.
+        """Pick the single best task to bid on this round, and bid on it.
 
-        v_n,m = (residual effort on the current task) + (effort for m),
-        which is the excavation instance of Eq. (7): the skills common
-        to both tasks are the haul-and-dig cycle, and only the UNFINISHED
-        part of the current task counts. As execution progresses the
-        first term shrinks, so the bid improves every round -- the
-        mechanism the whole paper is built on.
+        MATH -- Eq. (7). For each biddable task m:
+
+            v_m = residual + w1*tau_m + w2*E_m
+            residual = w1*tau_res + w2*E_res     (bidding.residual_cost)
+
+        `residual` is the effort still owed on the CURRENT task and is
+        the same for every candidate, so it does not change the ranking
+        WITHIN this robot -- but it does change how this robot compares
+        against OTHER robots, which is the point. A robot nearly finished
+        bids close to its raw task cost; a robot that just started bids
+        much higher. And because residual shrinks every tick as work
+        progresses, the same robot's bid on the same task improves round
+        over round -- the mechanism the whole paper is built on.
+
+        The robot then keeps the cheapest task it can actually WIN: for
+        tasks it does not already hold, it must beat the incumbent bid
+        (_cheaper_bid, Eq. 12's HT). Ownership is deliberately NOT a
+        filter -- in a silent auction you may outbid anyone, and the old
+        ownership check made whoever bid first the permanent holder.
+
+        Finally (Fig. 2) if this round's choice differs from last
+        round's, the previous bid is RELEASED before the new one is
+        placed, so a robot never holds two claims at once.
+
+        RETURNS (task_id or None, bid value).
+
+        CALLED BY: CBPAEAllocator.allocate, once per robot per tick.
         """
         self.prevBidTask = self.bidTask
         r_tau, r_e = residual_cost(model, robot)
@@ -253,7 +320,34 @@ class CBPAEAgent:
         robot.send({"sender": robot.robot_id, "tasks": tasks})
 
     def consensus(self, robot, messages, now: int) -> bool:
-        """Apply Tables 5, 6 and 7 to every task in every message."""
+        """Reconcile my task vectors against everything I just heard.
+
+        For each task in each message, ONE of three rule tables applies,
+        chosen by what that task is to me:
+
+          Table 7 (_parallelExecutionRule) -- I am executing it too.
+              Only possible after a comms dropout; the higher-indexed
+              robot backs off.
+          Table 5 (_bidTaskRule)           -- it is the task I am
+              bidding on. The contested case, so the rules are the most
+              detailed: bid value first, then bid/drop times as
+              tie-breakers.
+          Table 6 (_otherTaskRule)         -- anything else. I have no
+              stake, so these rules are essentially "believe the
+              better-informed robot", ordered by execution status.
+
+        Each table returns a tuple of ACTION NAMES, which _apply then
+        carries out (Table 4's six actions: Leave, Update, Release,
+        Stop Execution, Update Bid Time, Update Time).
+
+        Also increments msg_count per message processed -- the quorum
+        counter tryAssign uses to decide the fleet has had a fair chance
+        to contest this bid.
+
+        RETURNS True if anything changed.
+
+        CALLED BY: CBPAEAllocator.allocate, after messages are delivered.
+        """
         n = robot.robot_id
         changed = False
         for msg in messages:
@@ -278,6 +372,31 @@ class CBPAEAgent:
 
     # ---- Table 5: consensus rules for the Bid Task ---------------- #
     def _bidTaskRule(self, n, j, a_k, b_k, e_k, tb_k, td_k) -> tuple:
+        """Table 5: what to do about the task I am bidding on, having
+        heard robot k's view of it.
+
+        Arguments are the sender's five values for this task:
+        a_k (who k thinks holds it), b_k (at what bid), e_k (execution
+        status), tb_k (bid time), td_k (drop time). My own equivalents
+        are read from my vectors as a_n/b_n/e_n/tb_n/td_n.
+
+        STRUCTURE: split first by MY execution status (NALC or DROP --
+        those are the only two a bid task can have), then by the
+        SENDER's, then by bid comparison:
+
+            b_k < b_n            -> the sender's bid is better; release
+                                    mine and adopt theirs
+            b_k = b_n, tb_k > tb_n -> tie on value, so break on robot
+                                    index (a_k < n) as Table 5 specifies
+            b_k > b_n, tb_k > tb_n -> mine is better but theirs is
+                                    fresher; just bump my bid time
+
+        The e_k in (EXEC, FNSH) rows are the important ones for
+        correctness: if somebody is already digging or has finished the
+        task I am bidding on, my bid is void and I adopt their view.
+
+        Returns a tuple of action names for _apply.
+        """
         e_n = self._status(j)
         b_n, tb_n, td_n = self._bid(j), self._tb(j), self._td(j)
 
@@ -326,6 +445,26 @@ class CBPAEAgent:
 
     # ---- Table 6: all other tasks --------------------------------- #
     def _otherTaskRule(self, n, j, a_k, b_k, e_k, tb_k, td_k) -> tuple:
+        """Table 6: what to do about a task I have no stake in.
+
+        Simpler than Table 5 because there is nothing of mine to defend:
+        the question is only "is the sender better informed than I am?",
+        and the answer is driven by execution status and timestamps
+        rather than by bid values.
+
+        The ordering of cases encodes an information hierarchy --
+        FNSH (finished) is unconditionally believed, EXEC (someone is
+        digging) beats NALC (nobody is), and DROP is believed when its
+        drop time is fresher than what I hold. Timestamps break the
+        remaining ambiguity.
+
+        This table is how information about distant tasks spreads
+        through the fleet: robots relay what they were told about tasks
+        they will never touch.
+
+        Returns ("update",) or () -- Table 6 has no release/stop actions,
+        since I hold nothing to release.
+        """
         e_n = self._status(j)
         a_n, tb_n, td_n = self._winner(j), self._tb(j), self._td(j)
         UPD = ("update",)
@@ -383,6 +522,25 @@ class CBPAEAgent:
 
     # ---- Table 4: the six actions --------------------------------- #
     def _apply(self, actions, robot, j, entry, now) -> bool:
+        """Carry out the action names a rule table returned (Table 4).
+
+        The six actions, and what each writes:
+          Leave           -- (empty tuple) nothing changes.
+          stopexecution   -- abandon the task I am executing, but ONLY if
+                             can_abandon allows it (Sec. 3.7.4).
+          release         -- give up my claim: b = NOCOST, a = NBID,
+                             e = NALC, and reset the message counter.
+          update          -- adopt the sender's five values wholesale.
+          updatebidtime   -- keep my values but refresh tb to now.
+          updatetime      -- refresh tb to now AND adopt the sender's td.
+
+        Several can apply at once (e.g. ("release", "update")), and the
+        order here matters: release clears my claim before update
+        installs the sender's.
+
+        RETURNS True if anything actually changed, which propagates up to
+        consensus and then to the allocator's convergence check.
+        """
         if not actions:
             return False                                        # Leave
         a_k, b_k, e_k, tb_k, td_k = entry
@@ -435,10 +593,27 @@ class CBPAEAgent:
     # execution status bookkeeping
     # -------------------------------------------------------------- #
     def syncExecution(self, model, robot, now: int) -> None:
-        """Keep the E vector in step with what the robot is physically
-        doing. Replaces the old `task.future_remaining -= capacity`
-        hack, which was never restored when a task finished or was
-        abandoned and so leaked capacity out of the pool."""
+        """Keep the E (execution status) vector in step with what the
+        robot is physically doing.
+
+        The bridge between BELIEF (the task vectors) and REALITY (what
+        robot.py actually did last tick). Three jobs:
+          1. Mark every finished task FNSH.
+          2. If I am executing something, record it as EXEC and claim it.
+          3. If I STOPPED executing without finishing, record a DROP with
+             a drop time -- see the long comment inline, this is the case
+             that used to poison the whole fleet's beliefs.
+
+        Then hands off to _reconcile for the repairs consensus cannot
+        make on its own.
+
+        CALLED BY: CBPAEAllocator.allocate, first thing each tick, before
+        any bidding.
+
+        Replaces the old `task.future_remaining -= capacity` hack, which
+        was never restored when a task finished or was abandoned and so
+        leaked capacity out of the pool.
+        """
         for t in model.tasks.all:
             if t.done and self._status(t.task_id) != FNSH:
                 self.E[t.task_id] = FNSH
@@ -493,6 +668,14 @@ class CBPAEAgent:
         empty dig site is visible from the site, and tryAssign already
         reads task.assigned_to directly, so this adds no omniscience that
         was not in the file already.
+
+        THE TWO REPAIRS:
+          - I believe a task is EXEC but nobody is actually on it
+            -> reset it to NALC so it can be bid on again.
+          - I believe a task is free but somebody demonstrably IS on it
+            -> mark it EXEC and drop my bid on it.
+
+        CALLED BY: syncExecution, at the end.
         """
         for t in model.tasks.unfinished:
             j = t.task_id
@@ -516,7 +699,14 @@ class CBPAEAgent:
 
         The paper's trigger is a new emergency task. Ours is Phase 4:
         a hazard or obstacle has made the target unreachable, so holding
-        the task just blocks it for everyone."""
+        the task just blocks it for everyone.
+
+        TEST: re-price the current task with leg_cost; a None dump cell
+        means no route exists any more. If so, abandon it and record a
+        DROP with a drop time, so Tables 5/6 can propagate the news.
+
+        CALLED BY: CBPAEAllocator.allocate, every tick before bidding.
+        """
         if not robot.can_abandon:
             return False
         task = model.tasks.get(robot.task_id)
@@ -547,6 +737,18 @@ class CBPAEAgent:
         emergency task and excavation has no priorities, so `ratio=None`
         reproduces the strict-paper behaviour exactly. If you switch it
         on, say so in the report and quote the ratio you used.
+
+        MATH -- the drop test:
+
+            drop  iff  w1*tau_now + w2*E_now  >  execBid * ratio
+
+        where execBid is the price this task was WON at (recorded by
+        tryAssign) and the left side is what it would cost re-priced from
+        here, right now. So ratio = 2.0 means "drop it if it has become
+        more than twice as expensive as I bid".
+
+        CALLED BY: CBPAEAllocator.allocate, every tick. Returns False
+        immediately when drop_cost_ratio is None (the default).
         """
         if ratio is None or not robot.can_abandon:
             return False
@@ -571,10 +773,33 @@ class CBPAEAgent:
     # Sec. 3.7.3: task assignment
     # -------------------------------------------------------------- #
     def tryAssign(self, model, robot, now: int) -> bool:
-        """Assign only after the bidding window has elapsed AND enough
-        messages have been processed without losing the bid. This is
-        what makes parallel allocation of one task impossible; without
-        it two robots can both commit in the same tick."""
+        """Commit to my bid task -- but only once it is safe to do so.
+
+        THE TWO-PART SAFETY GATE (Sec. 3.7.3), which is what makes it
+        impossible for two robots to start the same task:
+
+            now - tb_j  >=  BID_WINDOW          (time has passed)
+            msg_count   >=  |current neighbours| (everyone has replied)
+
+        The first gives rivals a fixed window to contest the bid. The
+        second requires having actually processed a message from every
+        robot within radio range WITHOUT losing the bid in the meantime
+        (msg_count resets to 0 whenever a claim is lost -- see placeBid
+        and _apply). Together they mean: I waited, everyone who could
+        object has spoken, and nobody outbid me.
+
+        Note the quorum is the CURRENT neighbour count, so an isolated
+        robot has a quorum of zero and can commit immediately. A floor of
+        1 would make it wait forever for a message that can never arrive.
+
+        Before committing it also re-checks ground truth (is the task
+        already done or taken?) and handles assign() refusing.
+
+        On success: status EXEC, remember the winning price for
+        dropIfTooCostly, and reset the counter.
+
+        CALLED BY: CBPAEAllocator.allocate, as the final stage of a tick.
+        """
         j = self.bidTask
         if j is None or robot.task_id is not None:
             return False
@@ -633,6 +858,32 @@ class CBPAEAllocator:
         self.drop_cost_ratio = drop_cost_ratio
 
     def allocate(self, model: "ExcavationModel") -> None:
+        """One CBPAE round -- exactly one per tick, no inner loop.
+
+        FOUR STAGES, in order:
+
+          1. PER ROBOT: sync execution status against reality, drop the
+             current task if it has become unreachable (or too costly),
+             compute this round's bid, and broadcast the four-task
+             message.
+          2. DELIVER the messages.
+          3. PER ROBOT: run consensus (Tables 5/6/7) on what arrived.
+          4. PER ROBOT: try to commit, subject to the bidding window and
+             message quorum.
+
+        CONTRAST WITH CBBA: CBBA runs many rounds inside a single tick
+        and stops when nothing changes. CBPAE runs ONE round per tick and
+        never checks for convergence, because it does not need to -- the
+        bidding window in tryAssign spans several ticks, so the fleet
+        gets its rounds of agreement anyway, and meanwhile robots are
+        executing rather than waiting. That is the "parallel auction AND
+        execution" of the name.
+
+        `now` is the round counter, which doubles as the algorithm's
+        clock for every bid/drop timestamp.
+
+        CALLED BY: model.step, once per tick, via model.allocator.
+        """
         self.round += 1
         now = self.round
 

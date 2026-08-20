@@ -4,6 +4,17 @@
 2. The incremental simulation reproduces the closed-form tau_ij and E_ij
    exactly for a single robot on a single task (no contention), which is
    the property that makes bids meaningful predictions of execution.
+
+Run with:  python -m pytest tests/ -v
+
+New-reader primer: read this file top to bottom as a worked example of
+the cost model. Each `test_*_hand_computed` function plugs simple,
+easy-to-verify-by-hand numbers into costs.py's formulas and checks the
+result against arithmetic done in the comment above it -- a good way to
+see exactly what tau_ij/energy_ij compute. The later tests build an
+actual ExcavationModel and step it tick-by-tick to prove the live
+simulation matches those same formulas, and that a full run finishes
+and is reproducible given the same seed.
 """
 
 import math

@@ -6,6 +6,12 @@ nothing else changes. Results land in a tidy DataFrame keyed by
 (allocator, seed/iteration), ready for pandas/matplotlib analysis.
 
     python run_batch.py
+
+Uses Mesa's own `batch_run` helper, which runs ExcavationModel once for
+every combination of values in `params` (a basic grid search) and for
+every seed in `rng`, collecting each run's metrics into one big table.
+For a hand-rolled version of the same idea with more control over what's
+measured, see batch30.py.
 """
 
 import pandas as pd
@@ -13,6 +19,8 @@ from mesa.batchrunner import batch_run
 
 from excavsim.model import ExcavationModel
 
+# Every combination of these values gets its own run (a "batch" =
+# len(allocator) * len(n_robots) * len(n_tasks) * len(rng) model runs).
 params = {
     "allocator": ["greedy"],          # + "cbba", "cbpae", "moa-cbba"
     "n_robots": [2, 4],

@@ -30,6 +30,15 @@ it in TO_TASK for the rest of the run; and (c) allocator disagreement,
 where two robots each believe they won the same chunk. None of these
 raise, and none of them look different from "the simulation is just
 slow" on the map. They each have a named check below.
+
+New-reader primer: this whole module is a diagnostics add-on, entirely
+separate from the simulation itself -- delete this file and every other
+module still runs unchanged. `attach(model)` works by MONKEY-PATCHING:
+it wraps `model.step` (and the allocator's `allocate`) with thin
+before/after hooks (see `_wrap` below) that record timing and take a
+snapshot, without touching a single line of model.py or robot.py. That
+is why it can be bolted onto any model instance from the GUI or a
+one-off script without editing the simulation code at all.
 """
 
 from __future__ import annotations
@@ -93,7 +102,9 @@ class _Prediction:
     tau: float
     e: float
     dist_at_bid: float = 0.0
-    sharers: int = 1
+    sharers: int = 1          # sharer count the BID assumed
+    volume: float = 0.0       # task.remaining when the bid was priced
+    peak_sharers: int = 1     # most robots seen on it during execution
 
 
 @dataclass
@@ -195,13 +206,35 @@ class DebugMonitor:
 
     def accuracy_summary(self) -> dict:
         """bid == uncontended execution is the invariant costs.py is built
-        around; this is the measured version of it. Ratios below 1.0 mean
-        the bid OVER-charged, above 1.0 that execution cost more than the
-        bid promised (contention, re-routes, hazards)."""
+        around; this is the measured version of it.
+
+        MATH: for each completed task, a ratio of what it ACTUALLY cost
+        against what its bid PROMISED:
+
+            tau_ratio = actual ticks  / predicted tau_ij
+            e_ratio   = actual energy / predicted E_ij
+
+        Ratios below 1.0 mean the bid OVER-charged, above 1.0 that
+        execution cost more than the bid promised (contention, re-routes,
+        hazards). Mean, max AND min are all reported: a bid that came in
+        UNDER cost breaks the invariant in the direction nobody checks,
+        and mean+max alone hid an x0.77 outlier completely.
+
+        `n_reshared` counts tasks whose sharer count changed between bid
+        and execution -- the MOA-CBBA-specific source of drift, since a
+        bid priced for V/2 executed at V/3 will not match.
+
+        Predictions are recorded at assignment time by _on_assign and
+        closed out by _on_finish.
+
+        CALLED BY: the GUI's debug panel, and snapshot_text.
+        """
         if not self.accuracy:
             return {}
         taus = [a["tau_ratio"] for a in self.accuracy if a["tau_ratio"]]
         es = [a["e_ratio"] for a in self.accuracy if a["e_ratio"]]
+        mt = [a["model_tau"] for a in self.accuracy if a.get("model_tau")]
+        me_ = [a["model_e"] for a in self.accuracy if a.get("model_e")]
         return {
             "n": len(self.accuracy),
             "tau_ratio_mean": sum(taus) / len(taus) if taus else 0.0,
@@ -213,12 +246,40 @@ class DebugMonitor:
             "e_ratio_mean": sum(es) / len(es) if es else 0.0,
             "e_ratio_max": max(es) if es else 0.0,
             "e_ratio_min": min(es) if es else 0.0,
+            "model_tau_mean": (sum(mt) / len(mt)) if mt else 0.0,
+            "model_e_mean": (sum(me_) / len(me_)) if me_ else 0.0,
+            "n_reshared": sum(1 for a in self.accuracy
+                              if a.get("bid_sharers") != a.get("real_sharers")),
         }
 
     # ---------------------------------------------------------------- #
     # invariant checks — recomputed every tick, cheap by design
     # ---------------------------------------------------------------- #
     def run_checks(self) -> list[tuple[int, str]]:
+        """Re-verify every invariant against the CURRENT model state and
+        return a list of (level, message) for each violation.
+
+        Recomputed from scratch each tick rather than accumulated, so the
+        list always describes what is wrong RIGHT NOW. Empty means the
+        simulation is internally consistent.
+
+        THE INVARIANTS CHECKED (numbered inline below):
+          1. BAM consistency, both directions -- every seat on a task
+             points at a robot that is actually working it, and every
+             working robot holds a seat. Violations strand a task
+             permanently.
+          2. One robot per cell, the physics rule robot.py guarantees.
+          3. Conservation of soil: ground + hoppers + delivered is
+             constant. Any drift means volume was created or destroyed.
+          4. Progress -- has anything changed in STALL_TICKS ticks?
+          5. Idle robots while reachable work exists (allocator stuck).
+          6. Robots in TO_TASK with an empty planned path (mover stuck).
+          7. Allocator disagreement -- two robots believing they won the
+             same task.
+
+        CALLED BY: on_tick_end, which is invoked by the wrapper attach()
+        installs around model.step.
+        """
         m = self.model
         out: list[tuple[int, str]] = []
         add = out.append
@@ -585,7 +646,8 @@ class DebugMonitor:
                 self._note_error()
         self.predictions[(robot.robot_id, task_id)] = _Prediction(
             tick=m.tick, energy=robot.energy_used, tau=tau, e=e,
-            dist_at_bid=robot.distance_travelled, sharers=sharers)
+            dist_at_bid=robot.distance_travelled, sharers=sharers,
+            volume=task.remaining, peak_sharers=sharers)
         self.bump(robot.robot_id, "assign")
         share_txt = "" if sharers == 1 else f" | shared {sharers}-way"
         self.log("ASSIGN",
@@ -607,10 +669,50 @@ class DebugMonitor:
         d_e = robot.energy_used - pred.energy
         tau_r = (d_tick / pred.tau) if pred.tau > 0 else None
         e_r = (d_e / pred.e) if pred.e > 0 else None
+
+        # TWO DIFFERENT ERRORS, previously multiplied together and
+        # reported as one ratio:
+        #
+        #   MODEL error    -- does costs.py describe what robot.py does?
+        #                     This is the invariant the whole cost model
+        #                     rests on and it SHOULD sit at x1.00.
+        #   FORECAST error -- did the bid guess the right number of
+        #                     sharers? It cannot sit at x1.00: how many
+        #                     robots end up on a task depends on future
+        #                     auctions, which depend on future positions,
+        #                     which depend on the allocation being made
+        #                     right now. Three estimators were measured
+        #                     (current occupancy, seats_for, the bid
+        #                     table) and all three are wrong in both
+        #                     directions.
+        #
+        # Re-pricing the bid at the sharer count execution ACTUALLY saw
+        # isolates the first. A run where model_ratio is ~1.00 and the
+        # raw ratio is not tells you the physics is right and the
+        # dynamics are simply uncertain -- a very different diagnosis
+        # from a broken cost model, and the raw ratio alone cannot tell
+        # them apart.
+        model_tau = model_e = None
+        if pred.peak_sharers != pred.sharers and pred.volume > 0:
+            try:
+                task = m.tasks.get(task_id)
+                t2, e2, q2 = leg_cost(m, robot, task,
+                                      volume=pred.volume / pred.peak_sharers)
+                if q2 is not None and t2 > 0:
+                    model_tau = d_tick / t2
+                    model_e = d_e / e2 if e2 > 0 else None
+            except Exception:                   # pragma: no cover
+                self._note_error()
+        else:
+            model_tau, model_e = tau_r, e_r
+
         self.accuracy.append({"robot": robot.robot_id, "task": task_id,
                               "tau_pred": pred.tau, "tau_real": d_tick,
                               "e_pred": pred.e, "e_real": d_e,
-                              "tau_ratio": tau_r, "e_ratio": e_r})
+                              "tau_ratio": tau_r, "e_ratio": e_r,
+                              "model_tau": model_tau, "model_e": model_e,
+                              "bid_sharers": pred.sharers,
+                              "real_sharers": pred.peak_sharers})
         self.log("DONE",
                  f"finished T{task_id} in {d_tick} ticks / {d_e:.2f} E "
                  f"(bid said {pred.tau:.1f} / {pred.e:.2f}"
@@ -661,8 +763,25 @@ class DebugMonitor:
                 tuple((r.stage, r.task_id) for r in m.robots),
                 sum(1 for t in m.tasks.all if t.completed_tick is not None))
 
+    def _track_sharers(self) -> None:
+        """Remember the most robots ever seen on a task a bid is open on.
+
+        The bid assumed some sharer count; execution had another. Keeping
+        the peak lets _on_finish separate the two error sources instead
+        of reporting their product as one number.
+        """
+        m = self.model
+        for (rid, tid), pred in self.predictions.items():
+            try:
+                n = len(m.tasks.get(tid).assignees)
+            except KeyError:                    # pragma: no cover
+                continue
+            if n > pred.peak_sharers:
+                pred.peak_sharers = n
+
     def on_tick_end(self) -> None:
         m = self.model
+        self._track_sharers()
         sig = self._progress_signature()
         if sig != self._progress_sig:
             self._progress_sig = sig
@@ -730,7 +849,28 @@ def _wrap(obj, name: str, before=None, after=None) -> bool:
 
 
 def attach(model, max_events: int = 800) -> DebugMonitor:
-    """Attach (once) and return the monitor. Safe to call every frame."""
+    """Attach (once) and return the monitor. Safe to call every frame.
+
+    HOW IT WORKS -- monkey-patching, not inheritance. It wraps BOUND
+    METHODS on this model instance (via _wrap) with before/after hooks:
+
+        model.step            -> time it, snapshot robots, run checks
+        model.allocator.allocate -> time it, note non-convergence
+        model.dynamics.step   -> log hazard/obstacle/weather events
+        each robot's assign / _finish_task / abandon_task / _reroute /
+            _plan_leg / _go_dump -> record events and bid predictions
+
+    Nothing in excavsim needs to know this exists, a fresh model (GUI
+    Reset, batch_run) is simply attached again, and because the monitor
+    consumes no RNG draws a monitored run is bit-identical to an
+    unmonitored one.
+
+    IDEMPOTENT: returns the existing monitor if one is already attached,
+    and _wrap refuses to double-wrap, so calling this every GUI frame is
+    safe.
+
+    CALLED BY: app.py's panels, and debug.main for headless runs.
+    """
     existing = getattr(model, "_debug", None)
     if existing is not None:
         return existing
@@ -926,11 +1066,14 @@ def snapshot_text(model, n_events: int = 20, min_level: int = INFO) -> str:
                      f"energy x{acc['e_ratio_min']:.2f}/"
                      f"x{acc['e_ratio_mean']:.2f}/"
                      f"x{acc['e_ratio_max']:.2f}")
-        if min(acc['tau_ratio_min'], acc['e_ratio_min']) < 0.95:
-            lines.append("  NOTE: a bid came in UNDER its execution cost. "
-                         "costs.py documents the invariant one-directionally "
-                         "(realized >= bid); re-planning after a reroute can "
-                         "break it the other way.")
+        lines.append(f"  cost model alone (re-priced at the sharer count "
+                     f"execution saw): time x{acc['model_tau_mean']:.2f}, "
+                     f"energy x{acc['model_e_mean']:.2f}  "
+                     f"[{acc['n_reshared']}/{acc['n']} tasks changed sharers]")
+        if acc['model_tau_mean'] and abs(acc['model_tau_mean'] - 1.0) > 0.25:
+            lines.append("  NOTE: the COST MODEL itself is off, not just the "
+                         "sharer forecast -- costs.py and robot.py have "
+                         "drifted apart and every bid is affected.")
     if mon.checks:
         lines.append("checks:")
         lines += [f"  [{LEVEL_NAME[lv]}] {txt}" for lv, txt in mon.checks]

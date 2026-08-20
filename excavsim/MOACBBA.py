@@ -58,6 +58,19 @@ the robot re-adopts a task it has dropped. That exact bug has now been
 hit twice in this codebase (CBPAE.release, and the first draft of this
 file), so it is worth naming: min-cost consensus with no clock cannot
 distinguish new information from a stale echo.
+
+New-reader primer: MOA-CBBA is this project's own extension of CBBA
+(allocation.py), built to fix two things a plain reward-maximising
+auction handles badly for this domain: it doesn't naturally balance
+WORKLOAD (one robot can end up doing far more than others, since
+finishing late costs a robot nothing extra), and it can't put more than
+one robot on the same task at once. Read the four "MECHANISMS" above in
+order -- each is a self-contained fix (cost-based bidding, makespan-
+aware pricing, big-robot/big-task matching, sharing + switching) and
+each can be turned off individually (see the constants just below) to
+measure what it's actually buying. If you already understand
+allocation.py's CBBAAgent, MOACBBAAgent is the same bundle-building idea
+with a different price tag.
 """
 
 from __future__ import annotations
@@ -102,6 +115,47 @@ SWITCH_MARGIN = 0.20       # en-route switch must be this much cheaper
 # information a robot gains en route is worth more. Enable with
 # MOACBBAAllocator(enable_switching=True).
 ENABLE_SWITCHING = False
+# How many tasks a robot may add to its bundle in ONE auction round.
+#
+# The problem this fixes: createBundle used to fill the whole bundle
+# (up to L_t = 6 tasks) before a single message was exchanged. So in
+# round 1 every robot decided its entire schedule from the SAME stale
+# c_k -- and with N robots there is always exactly one bottleneck and
+# N-1 robots who all correctly compute "extra work is free for me"
+# (measured: 3 of 4 robots in 99.5% of ticks). All of them then took
+# work on that basis, and after they did, several had passed the
+# bottleneck they were measuring themselves against. The work was not
+# free after all; they just could not know it yet.
+#
+# Adding one task per round forces a broadcast between every decision,
+# so the second task is chosen against a c_k that already reflects the
+# first. Robots still cannot un-take work -- createBundle only grows,
+# and only releaseOutbid shrinks -- so the fix is to stop them
+# over-committing rather than to let them back out.
+#
+# None = old behaviour (fill the bundle in one round).
+MAX_ADDS_PER_ROUND = 1
+
+# Route around where a sensed obstacle is ABOUT to be, not just where it
+# was seen. Obstacles step with probability obstacle_move_probability
+# every tick, so the eight cells around one are a coin flip on being
+# blocked by the time a robot arrives -- and being blocked costs
+# STUCK_LIMIT waiting ticks plus a re-plan, while stepping one cell wide
+# costs at most one extra move.
+#
+# Deliberately a PREFERENCE with a fallback, not a wall: _plan_leg tries
+# the halo first and re-plans without it if that leaves no route. And
+# deliberately short-horizon (HALO_HORIZON in robot.py): the prediction
+# is only good for the next few ticks, after which the obstacle has
+# wandered somewhere unrelated.
+#
+# NOTE the honest cost: leg_cost prices bids on known_blocked() WITHOUT
+# the halo, while execution plans WITH it, so a halo detour is a length
+# the bid did not charge for. The gap is small -- a halo route is
+# typically one or two steps longer -- and it is a deliberate trade
+# against the wait it avoids, but it does widen bid-vs-actual.
+OBSTACLE_HALO = True
+
 ROUND_CEILING = 200
 
 
@@ -121,32 +175,83 @@ class MOACBBAAgent:
     # ---------------- bid table ------------------------------------- #
     def _live(self, j) -> list[tuple[float, int]]:
         """(cost, robot) for every robot with a live bid on j, cheapest
-        first, ties on the lower robot id."""
+        first, ties on the lower robot id.
+
+        "Live" means cheaper than RELEASED (+inf) -- a release is
+        recorded as an infinite-cost bid rather than a deletion, so that
+        it carries a timestamp and can win a merge against a peer still
+        echoing the old claim. Sorting tuples sorts by cost then robot
+        id, giving the deterministic tie-break every robot agrees on.
+
+        CALLED BY: winners and worst_seated.
+        """
         out = [(c, i) for (t, i), (c, s) in self.bids.items()
                if t == j and c < RELEASED]
         out.sort()
         return out
 
     def winners(self, j, seats: int) -> list[int]:
+        """The `seats` cheapest live bidders on task j -- who I believe
+        will be digging it. This replaces CBBA's single z_ij winner and
+        is what lets several robots hold one task."""
         return [i for _c, i in self._live(j)[:max(0, seats)]]
 
     def seated(self, j, me, seats: int) -> bool:
+        """Am I among the winners of task j?"""
         return me in self.winners(j, seats)
 
     def worst_seated(self, j, seats: int) -> float:
-        """Cost of the marginal seat: what a newcomer has to beat."""
+        """Cost of the marginal seat: what a newcomer has to beat.
+
+        MATH: the cost of the k-th cheapest live bid, where k = seats.
+        If fewer than `seats` robots have bid, a seat is still free and
+        this returns RELEASED (+inf), so any finite bid wins it.
+
+        This is the multi-seat generalisation of CBBA's y_ij threshold:
+        instead of "beat the single winner", it is "beat the cheapest
+        loser who currently has a seat".
+
+        CALLED BY: createBundle, to test whether a seat is winnable.
+        """
         live = self._live(j)
         return live[seats - 1][0] if len(live) >= seats else RELEASED
 
     def place(self, j, me, cost) -> None:
+        """Record my bid on task j, stamped with the current auction
+        clock. The stamp is what lets resolveConflicts tell new
+        information from a stale echo."""
         self.bids[(j, me)] = (cost, self._now)
 
     def release(self, j, me) -> None:
+        """Give up my seat on task j -- recorded as an infinite-cost bid
+        with a FRESH stamp, not as a deletion. A deletion would simply be
+        re-learned from the next peer who had not heard yet; a stamped
+        release wins the merge and sticks."""
         self.bids[(j, me)] = (RELEASED, self._now)
 
     # ---------------- costing --------------------------------------- #
     def pathCost(self, model, robot, path, sharers_fn=None) -> tuple[float, float]:
         """(completion time, energy) for executing `path` in order.
+
+        MATH -- walk the path accumulating both quantities, starting from
+        whatever the robot already owes on its current task:
+
+            t, e  =  residual_cost(robot)            (starting offset)
+            for each task j in path:
+                k        = expected sharers of j
+                tau, E   = leg_cost(j, from startPos, volume = V_j / k)
+                t += tau ;  e += E
+                startPos = q*_j     (next leg starts at this dump)
+
+        The returned `t` is this robot's projected COMPLETION TIME c_i,
+        which is exactly what gets gossiped to peers and used as the
+        makespan term in marginalCost. Threading startPos through is what
+        makes the cost order-dependent, as in CBBA's pathScoreCBBA.
+
+        Returns (INF, INF) if any leg is infeasible.
+
+        CALLED BY: createBundle (base cost and, via marginalCost, every
+        trial insertion) and broadcast (to advertise c_i).
 
         SHARING CORRECTION. leg_cost prices task.remaining as if this
         robot digs the whole thing alone. With k robots seated each digs
@@ -186,6 +291,45 @@ class MOACBBAAgent:
 
     def marginalCost(self, model, robot, trial, base_t, base_e,
                      others_c, affinity, sharers_fn=None) -> float:
+        """What adding a task to my schedule costs THE FLEET, not just me.
+
+        MECHANISM 2, the heart of MOA-CBBA. MATH:
+
+            before = max(base_t,  others_c)     fleet finish time now
+            after  = max(t_trial, others_c)     fleet finish time if I
+                                                take this task
+            cost   = w1*(after - before) + w2*(e_trial - base_e)
+            return   cost * affinity
+
+        where others_c = max completion time over all OTHER robots
+        (gossiped, see othersCompletion) and t_trial/e_trial come from
+        pathCost on the candidate path.
+
+        WHY THE max: J(x)'s makespan term is a max over robots, so the
+        fleet only finishes later if I become the bottleneck. Concretely:
+
+          - If I have slack (base_t and t_trial both below others_c),
+            then before == after == others_c and the makespan term is
+            ZERO. Extra work is free to me, so I keep winning tasks.
+          - Once my schedule passes others_c, every further task costs
+            its full duration in makespan terms, and I stop winning.
+
+        That is self-limiting load balancing, and it is exactly what a
+        purely local score cannot express -- a robot cannot know it is
+        the bottleneck without knowing everyone else's completion time.
+        Compare CBBA's pathScoreCBBA, which discounts by arrival time and
+        so only ever approximates this.
+
+        `affinity` is mechanism 3 (capacityAffinity), a multiplier in
+        (1-kappa, 1] applied to the whole cost -- a ranking preference
+        only, never applied to leg_cost, so the bid == execution
+        invariant is untouched.
+
+        Cost convention: LOWER WINS. Infeasible returns RELEASED (+inf).
+
+        CALLED BY: createBundle, once per candidate task per insertion
+        position.
+        """
         t, e = self.pathCost(model, robot, trial, sharers_fn)
         if t >= INF:
             return RELEASED
@@ -195,10 +339,30 @@ class MOACBBAAgent:
         return cost * affinity
 
     def capacityAffinity(self, robot, task, c_max, v_max, kappa) -> float:
-        """Multiplier in (1-kappa, 1]. Falls as capacity and remaining
-        volume both rise, so the big machine is drawn to the big pile.
-        Normalised by the fleet's largest hopper and the largest open
-        task so the term cannot dominate the physical cost."""
+        """MECHANISM 3: make big machines prefer big piles.
+
+        MATH -- a discount multiplier applied to the marginal cost:
+
+            match = (C_i / C_max) * (V_j / V_max)      in [0, 1]
+            return  1 - kappa * clamp(match, 0, 1)     in (1-kappa, 1]
+
+        Both factors are NORMALISED -- capacity against the fleet's
+        largest hopper, volume against the largest open task -- so the
+        product is a dimensionless "how well matched are these two"
+        score, and the discount can never exceed kappa (0.25 by default).
+        A large robot considering a large task gets up to 25% off; a
+        small robot on a small task gets no discount at all, but neither
+        does it get a penalty.
+
+        NOTE this is a RANKING preference layered on top of physics that
+        already partly does this: n_ij = ceil(V_j/C_i) means a small
+        hopper pays (2n-1)*d_dump on a big task while a large one pays a
+        single round trip, and that is already inside tau_ij and
+        energy_ij. So this term sharpens an existing effect rather than
+        inventing one. kappa = 0.0 removes it entirely for the ablation.
+
+        CALLED BY: createBundle, once per candidate task.
+        """
         if kappa <= 0.0 or c_max <= 0.0 or v_max <= 0.0:
             return 1.0
         match = (robot.spec.capacity / c_max) * (task.remaining / v_max)
@@ -206,7 +370,34 @@ class MOACBBAAgent:
 
     # ---------------- bundle ---------------------------------------- #
     def createBundle(self, model, robot, seats_fn, c_max, v_max,
-                     kappa, limit) -> None:
+                     kappa, limit, max_adds=None) -> None:
+        """Grow this robot's bundle -- MOA-CBBA's phase 1.
+
+        Structurally the same greedy insertion loop as CBBA's
+        createBundle, with three differences:
+
+          COST NOT REWARD    -- picks the task with the LOWEST
+              marginalCost (which already contains the makespan term and
+              capacity affinity) rather than the highest reward. There is
+              no admission threshold: CBBA's `gain > 0 and gain > y_ij`
+              can REJECT a task outright, which was measured leaving a
+              reachable task unclaimed for 62 ticks with the fleet idle.
+              A cost-minimiser always ranks; it never refuses.
+          SEATS NOT WINNERS  -- a task is winnable if a seat is free OR
+              this robot beats the marginal seat-holder (worst_seated),
+              rather than beating a single winner.
+          ONE ADD PER ROUND  -- with max_adds=1 the loop stops after one
+              insertion so a broadcast happens before the next decision.
+              See the MAX_ADDS_PER_ROUND note above: filling the whole
+              bundle from one stale snapshot of c_k had N-1 robots all
+              correctly computing "extra work is free for me" and all
+              acting on it simultaneously.
+
+        As in CBBA, every insertion POSITION is tried and the cheapest
+        kept, so ordering is optimised rather than appended to.
+
+        CALLED BY: MOACBBAAllocator.allocate, once per robot per round.
+        """
         me = robot.robot_id
         others_c = self.othersCompletion(me)
         # Expected sharers: what the task will look like once seated,
@@ -214,9 +405,11 @@ class MOACBBAAgent:
         # occupancy instead would price the first robot's bid as solo and
         # then never revise it.
         def expected(task):
-            n = len(task.assignees) + (0 if me in task.assignees else 1)
-            return min(n, seats_fn(task))
+            return self.expectedSharers(task, me, seats_fn(task))
+        added = 0
         while len(self.bundle) < limit:
+            if max_adds is not None and added >= max_adds:
+                break              # broadcast, hear the others, then continue
             base_t, base_e = self.pathCost(model, robot, self.path, expected)
             if base_t >= INF:
                 break
@@ -254,10 +447,24 @@ class MOACBBAAgent:
             self.bundle.append(j)
             self.path.insert(n, j)
             self.place(j, me, cost)
+            added += 1
 
     def releaseOutbid(self, robot, seats_fn, model) -> None:
         """Losing a seat invalidates every marginal cost after it, so the
-        tail goes too (Choi et al. Eq. 6)."""
+        tail goes too (Choi et al. Eq. 6).
+
+        The MOA-CBBA counterpart of CBBAAgent._releaseOutbid, with the
+        same reasoning -- every bid after the lost one was priced as a
+        marginal addition to a schedule that no longer exists -- but
+        testing seat membership (`seated`) rather than single ownership.
+
+        The task currently under execution is exempt and is preserved
+        even if it falls inside the released tail: the robot is
+        physically in that hole.
+
+        CALLED BY: MOACBBAAllocator.allocate, after each round's
+        consensus merge.
+        """
         me = robot.robot_id
         cut = None
         for idx, j in enumerate(self.bundle):
@@ -279,6 +486,16 @@ class MOACBBAAgent:
         self.bundle = self.bundle[:cut] + tail_lock
 
     def prune(self, model, robot) -> None:
+        """Drop finished tasks from the bundle and path, releasing their
+        seats.
+
+        Bundles persist across ticks, so without this they accumulate ids
+        of tasks that no longer exist. Note this releases the bid as well
+        as removing the entry -- a live bid on a finished task would keep
+        occupying a seat in every robot's view of the bid table.
+
+        CALLED BY: MOACBBAAllocator.allocate, per robot, before bidding.
+        """
         keep = []
         for j in self.bundle:
             task = model.tasks.get(j)
@@ -292,11 +509,80 @@ class MOACBBAAgent:
         self.bundle = keep
 
     # ---------------- gossip ---------------------------------------- #
+    def expectedSharers(self, task, me, seats: int) -> int:
+        """How many robots will be digging this task once the auction
+        settles -- read off the BID TABLE, not off current occupancy.
+
+        THE BUG THIS REPLACES had two halves, and the first is worse.
+
+        (a) INCONSISTENCY. The old estimate was
+
+                n = len(assignees) + (0 if me in assignees else 1)
+
+            which gives a DIFFERENT answer to different robots at the
+            same instant. For a task with one robot on it, the incumbent
+            priced it solo (V/1) while a challenger priced it shared
+            (V/2) -- so the two were comparing bids computed on volumes
+            that differ by a factor of two. That is not forecast error,
+            it is an unfair comparison, and it decides who wins a seat.
+
+        (b) FORECAST ERROR. task.assignees only changes in _execute(),
+            AFTER the whole auction has converged. So during bidding
+            every robot sees pre-auction occupancy and none of them can
+            see that two more are about to sit down. Measured: tasks
+            whose sharer count stayed put came in at x1.05 of bid; tasks
+            whose count changed came in at x0.87, and they were the
+            majority (28 of 52).
+
+        The bid table fixes both. `winners(j, seats)` is exactly the set
+        that _execute will seat, it is agreed across robots by consensus,
+        and it updates every round -- so all bidders price the same task
+        on the same volume, and that volume is what execution will
+        actually see.
+
+        Union with assignees because a robot already digging holds its
+        seat through a LOCKED_COST entry, and with `me` because asking
+        "what would this task cost me" presumes joining it.
+        """
+        j = task.task_id
+        who = set(self.winners(j, seats)) | set(task.assignees)
+        who.add(me)
+        return max(1, min(len(who), seats))
+
     def othersCompletion(self, me) -> float:
+        """c_max over every OTHER robot -- the fleet's current bottleneck
+        finish time, excluding me.
+
+        MATH:  others_c = max over k != me of c_k
+
+        This is the number marginalCost compares my schedule against to
+        decide whether taking another task actually delays the fleet.
+        Values arrive by gossip (resolveConflicts stores each peer's
+        broadcast c), so it is a BELIEF that may lag reality by a round.
+        Zero when nothing has been heard yet, which makes every robot
+        look like the bottleneck and therefore bid conservatively.
+
+        CALLED BY: createBundle, once per round.
+        """
         vals = [c for k, c in self.completions.items() if k != me]
         return max(vals) if vals else 0.0
 
     def broadcast(self, robot, now, sharers_fn=None) -> None:
+        """Send my whole bid table plus my projected completion time c_i.
+
+        Two payload fields:
+          "bids" -- every (task, robot) -> (cost, stamp) entry I hold,
+                    keyed as "j:i" strings because the payload is a plain
+                    dict that gets deep-copied through the network.
+          "c"    -- my projected completion time, recomputed here so it
+                    reflects the bundle I just built.
+
+        c_i MUST be computed on the same volume basis as the bids
+        (hence sharers_fn), or peers load-balance against a schedule that
+        does not exist.
+
+        CALLED BY: MOACBBAAllocator.allocate, per robot per round.
+        """
         self._now = now
         self.myCompletion, _e = self.pathCost(robot.model, robot, self.path,
                                               sharers_fn)
@@ -305,6 +591,32 @@ class MOACBBAAgent:
                     "c": self.myCompletion})
 
     def resolveConflicts(self, robot, messages, now) -> bool:
+        """Merge peers' bid tables into mine -- MOA-CBBA's phase 2.
+
+        Far simpler than CBBA's Table I, because the state is richer: a
+        per-(task, robot) table with timestamps needs no case analysis,
+        only a merge rule per key:
+
+            adopt theirs  iff  I have no entry
+                          OR   stamp_k > stamp_mine        (newer wins)
+                          OR   stamp_k == stamp_mine
+                               AND cost_k < cost_mine      (deterministic
+                                                            tie-break)
+
+        The timestamp is what makes a RELEASE survive contact with a peer
+        that has not heard it yet -- without it the peer echoes the dead
+        claim straight back and the robot re-adopts a task it dropped.
+        The equal-stamp tie-break on cost keeps two robots from
+        disagreeing about the same key forever.
+
+        Peer completion times c_k are absorbed here too, feeding
+        othersCompletion and therefore the makespan term of every
+        subsequent bid.
+
+        RETURNS True if anything changed (drives the convergence check).
+
+        CALLED BY: MOACBBAAllocator.allocate, per robot per round.
+        """
         self._now = max(self._now, now)
         changed = False
         for msg in messages:
@@ -333,11 +645,15 @@ class MOACBBAAllocator:
     name = "moa-cbba"
     AGENT_ATTR = "MOACBBA"
 
-    def __init__(self, max_sharers: int = MAX_SHARERS,
+    def __init__(self, obstacle_halo: bool = OBSTACLE_HALO,
+                 max_sharers: int = MAX_SHARERS,
                  min_share: float = MIN_SHARE,
                  capacity_affinity: float = CAPACITY_AFFINITY,
                  switch_margin: float = SWITCH_MARGIN,
-                 enable_switching: bool = ENABLE_SWITCHING) -> None:
+                 enable_switching: bool = ENABLE_SWITCHING,
+                 max_adds_per_round: int | None = MAX_ADDS_PER_ROUND) -> None:
+        self.max_adds_per_round = max_adds_per_round
+        self.obstacle_halo = bool(obstacle_halo)
         self.max_sharers = int(max_sharers)
         self.min_share = float(min_share)
         self.capacity_affinity = float(capacity_affinity)
@@ -356,11 +672,25 @@ class MOACBBAAllocator:
     def seats_for(self, model, task) -> int:
         """How many robots this task is worth, and can physically hold.
 
-        Three caps: policy, the volume (a seat must be worth min_share),
-        and the free work cells around the target -- work_candidates
-        yields at most 9, and bedrock, dumps, hazards and parked robots
-        all subtract. Seating more robots than there are cells to stand
-        in just produces collisions and STUCK_LIMIT waits."""
+        MECHANISM 4's seat budget. MATH -- the minimum of three caps:
+
+            seats = max(1, min( max_sharers,                  policy
+                                floor(V_j / min_share),       economics
+                                |work_candidates(l_j)| ))     physics
+
+        Each cap answers a different objection to piling robots onto one
+        task: policy is the configured ceiling (1 reproduces
+        single-robot-per-task exactly); the volume cap stops a robot
+        being seated for a sliver of work not worth the drive; and the
+        work-cell cap is hard physics -- there are at most 9 cells
+        adjacent to a target, fewer once bedrock, dumps, hazards and
+        parked robots are subtracted, and seating more robots than there
+        are places to stand just produces collisions and STUCK_LIMIT
+        waits.
+
+        CALLED BY: MOACBBAAllocator.allocate, wrapped as `seats_fn` and
+        passed down into createBundle, releaseOutbid and _execute.
+        """
         if self.max_sharers <= 1:
             return 1
         by_volume = int(task.remaining // self.min_share)
@@ -370,6 +700,33 @@ class MOACBBAAllocator:
 
     # ---------------------------------------------------------------- #
     def allocate(self, model) -> None:
+        """Run one full MOA-CBBA auction and seat whoever won.
+
+        Same four-stage shape as CBBAAllocator.allocate -- setup, rounds
+        of (bid, broadcast, deliver, resolve), then execute -- with these
+        differences:
+
+          - Candidate lists come from tasks.seats_open, so they include
+            tasks the robot is already travelling to (which is what makes
+            an en-route switch expressible as an ordinary auction result)
+            and tasks that already have other robots on them.
+          - releaseOutbid runs after every round's merge.
+          - The round budget uses N_min = min(|tasks| * max_sharers,
+            |robots| * L_t), scaled by max_sharers because there are that
+            many more seats to settle.
+          - There is no _trigger short-circuit: MOA-CBBA re-auctions
+            every tick, since gossiped completion times change
+            continuously as robots work.
+          - Execution is delegated to _execute, which handles seat caps
+            and optional en-route switching.
+
+        CALLED BY: model.step, once per tick, via model.allocator.
+        """
+        # Announce the routing policy every call rather than once at
+        # construction: SolaraViz swaps allocators on a live model, so a
+        # flag set in __init__ would outlive the allocator that wanted it.
+        model.obstacle_halo_enabled = self.obstacle_halo
+
         robots = list(model.robots)
         open_tasks = model.tasks.unfinished
         if not robots or not open_tasks:
@@ -402,10 +759,17 @@ class MOACBBAAllocator:
             for robot in robots:
                 agent = self._agent(robot)
                 agent.createBundle(model, robot, seats_fn, c_max, v_max,
-                                   self.capacity_affinity, robot.bundle_limit)
-                agent.broadcast(robot, self._clock,
-                                lambda t: max(1, min(len(t.assignees) or 1,
-                                                     seats_fn(t))))
+                                   self.capacity_affinity, robot.bundle_limit,
+                                   self.max_adds_per_round)
+                # c_i must be computed on the SAME volume basis as the
+                # bids, or the completion time a robot advertises is not
+                # the completion time its own bids were built from --
+                # every peer then load-balances against a schedule that
+                # does not exist.
+                agent.broadcast(
+                    robot, self._clock,
+                    lambda t: agent.expectedSharers(t, robot.robot_id,
+                                                    seats_fn(t)))
             model.comms.flush_and_deliver(model.tick)
             changed = [self._agent(r).resolveConflicts(r, r.receive_all(),
                                                        self._clock)
@@ -421,6 +785,38 @@ class MOACBBAAllocator:
 
     # ---------------------------------------------------------------- #
     def _execute(self, model, robots, seats_fn) -> None:
+        """Turn the settled auction into actual assignments.
+
+        TWO PHASES per robot:
+
+        1. EN-ROUTE SWITCHING (mechanism 4, OFF by default). A robot
+           still merely travelling to a task -- can_abandon, i.e. stage
+           TO_TASK with an empty hopper, Das et al. Sec. 3.7.4 -- may
+           swap to a cheaper task it has since won. Guarded three ways:
+
+               model.tick - switched_tick >= SWITCH_LOCKOUT   (15 ticks)
+               cost_new < cost_current * (1 - switch_margin)  (20%)
+               and both costs re-priced HERE, from the same position
+
+           The lockout and margin are not redundant: the margin compares
+           two costs at one instant, but both move every tick as the
+           robot walks, so a margin alone cannot stop a cycle. See the
+           ENABLE_SWITCHING note above for why this is disabled by
+           default (measured worse on both objectives).
+
+        2. SEATING. An idle robot walks its path and takes the first task
+           where it holds a seat AND the task has room. The seat cap is
+           enforced against the REGISTRY (task.assignees), not the local
+           bid table: mid-auction robots' views differ, so k robots can
+           each believe they hold one of the k cheapest seats, and only
+           the task itself knows how many have actually sat down.
+
+        If assign() refuses (no free work cell, no reachable dump), the
+        task is dropped from the bundle AND the seat released -- keeping
+        the bid alive would block a robot that could have taken it.
+
+        CALLED BY: allocate, as its final stage.
+        """
         for robot in robots:
             agent = self._agent(robot)
             me = robot.robot_id
@@ -438,8 +834,7 @@ class MOACBBAAllocator:
                 # rivals repriced this tick, so the comparison drifted in
                 # favour of switching a little more every tick.
                 def expected(task):
-                    n = len(task.assignees) + (0 if me in task.assignees else 1)
-                    return min(n, seats_fn(task))
+                    return agent.expectedSharers(task, me, seats_fn(task))
 
                 cur_task = model.tasks.get(robot.task_id)
                 cur_k = max(1, expected(cur_task))

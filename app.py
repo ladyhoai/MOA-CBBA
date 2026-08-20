@@ -25,6 +25,18 @@ Page 2 answer the second question:
     its bid promised.
 All of it is read-only: excavsim.debug consumes no RNG, so a run with
 the dashboard open is bit-identical to a headless batch run.
+
+New-reader primer: this file only draws pictures and tables of a model
+that already exists (built by excavsim/model.py) -- it contains no
+simulation logic of its own. It's built on Mesa's SolaraViz framework
+plus matplotlib for the map. Skim order if you're new to it: `page =
+SolaraViz(...)` near the bottom wires everything together (which
+components go on which tab); `model_params` right above it defines the
+sliders/dropdowns shown in the sidebar (their keys must match
+ExcavationModel's constructor arguments — see model.py); the `_draw_*`
+functions each paint one optional overlay onto the map (robot paths,
+sensor discs, hazards, ...); and `agent_portrayal`/`layer_portrayal`
+tell Mesa's renderer how to colour robots/tasks/property layers.
 """
 
 import matplotlib.patheffects as patheffects
@@ -64,8 +76,9 @@ dbg_on = solara.reactive(True)        # master switch for every overlay
 dbg_paths = solara.reactive(True)     # planned A* routes
 dbg_targets = solara.reactive(True)   # p* (dig cell) and q* (unload cell)
 dbg_ids = solara.reactive(True)       # R0.. / T0.. labels
-dbg_blocked = solara.reactive(False)  # everything blocked_cells() returns
-dbg_comms = solara.reactive(False)    # who can hear whom
+dbg_blocked = solara.reactive(True)   # everything blocked_cells() returns
+dbg_comms = solara.reactive(True)     # who can hear whom
+dbg_sensor = solara.reactive(True)    # lidar disc + what the robot cannot see
 dbg_focus = solara.reactive("all")    # "all" or "R3": draw one robot only
 log_level = solara.reactive("info")   # event-log threshold
 
@@ -124,6 +137,15 @@ def _next_task(r):
 
 
 def agent_portrayal(agent):
+    """Tell Mesa's renderer how to draw one agent on the map.
+
+    Two kinds exist: TaskMarker (a yellow square, the excavation site)
+    and ExcavatorRobot (a circle coloured by its current Stage, per
+    STAGE_COLORS above -- grey idle, orange travelling, red digging, blue
+    hauling, purple unloading). zorder puts robots on top of tasks.
+
+    CALLED BY: Mesa's SpaceRenderer, once per agent per redraw.
+    """
     if isinstance(agent, TaskMarker):
         return AgentPortrayalStyle(color="#f1c40f", marker="s", size=90,
                                    zorder=2, edgecolors="black",
@@ -134,6 +156,18 @@ def agent_portrayal(agent):
 
 
 def layer_portrayal(layer):
+    """Tell Mesa's renderer how to shade a property layer, or None to
+    hide it.
+
+    The model carries three layers (terrain, soil_volume, elevation) but
+    only ONE is drawn at a time -- whichever the `show_layer` dropdown
+    currently selects; every other layer returns None. Terrain uses the
+    discrete Fig. 1 palette (vmin/vmax pinned to 0..4 so colours map to
+    Terrain enum values regardless of what is on screen); elevation uses
+    a continuous colormap with a colorbar.
+
+    CALLED BY: Mesa's SpaceRenderer, once per layer per redraw.
+    """
     if layer.name != show_layer.value:
         return None
     if layer.name == "terrain":
@@ -147,6 +181,15 @@ def layer_portrayal(layer):
 # Fig. 1 right panel: metrics, robot list, task list (live tables)
 # ------------------------------------------------------------------ #
 def robot_frame(model) -> pd.DataFrame:
+    """One row per robot for the live side-panel table: class, stage,
+    position, current/next task, battery %, payload, energy, idle ticks
+    and tasks completed.
+
+    Rebuilt from scratch on every redraw -- cheap at fleet sizes of a
+    dozen, and it cannot go stale.
+
+    CALLED BY: the SidePanel component.
+    """
     rows = []
     for i, r in enumerate(model.robots):
         rows.append({
@@ -166,6 +209,17 @@ def robot_frame(model) -> pd.DataFrame:
 
 
 def task_frame(model) -> pd.DataFrame:
+    """One row per task for the live side-panel table: cell, remaining
+    vs. original volume, which robots hold seats, and a status string.
+
+    The status distinguishes four states worth telling apart: pending
+    (nobody on it), "k robot(s)" (being worked), "finishing" (volume
+    gone but material still in transit) and "done @ tick" (stamped
+    complete). That third state is exactly the gap between Task.done and
+    TaskRegistry.all_done described in tasks.py.
+
+    CALLED BY: the SidePanel component.
+    """
     rows = []
     for t in model.tasks.all:
         if t.done and t.completed_tick is not None:
@@ -317,6 +371,7 @@ def SidePanel(model):
 
         # --- health line: the one-glance "is anything wrong" ---------- #
         HealthLine(mon)
+        ConfigPanel(model)
 
         # --- overlay switches ---------------------------------------- #
         DebugSwitches(model)
@@ -326,6 +381,60 @@ def SidePanel(model):
         solara.DataFrame(robot_frame(model), items_per_page=12)
         solara.Markdown("**Tasks**")
         solara.DataFrame(task_frame(model), items_per_page=10)
+
+
+@solara.component
+def ConfigPanel(model):
+    """What this run is ACTUALLY configured as.
+
+    Every value here is read off the live model object, never off
+    model_params. The two can disagree -- model_params is what the
+    widgets will send on the NEXT Reset, the model is what is running
+    now -- and when they did, there was no way to tell from the screen.
+    """
+    update_counter.get()
+    a = model.allocator
+    rng = model.comms.comm_range
+    dyn = model.dynamics
+
+    def row(k, v):
+        return f"| {k} | {v} |"
+
+    rows = [
+        row("allocator", f"`{getattr(a, 'name', type(a).__name__)}`"),
+        row("fleet", f"`{model.fleet_mode}` — "
+                     + ", ".join(f"{k}×{v}" for k, v in
+                                 sorted(model.fleet_summary.items()))),
+        row("robots / tasks", f"{len(model.robots)} / {len(model.tasks.all)}"),
+        row("objective", f"w1={model.w1:g}, w2={model.w2:g}"),
+        row("comm range", "unlimited" if rng is None else f"{rng:g} cells"),
+        row("lidar sensing", "ON" if model.sensing_enabled else "OFF (omniscient)"),
+    ]
+    if model.sensing_enabled:
+        radii = ", ".join(f"R{r.robot_id} {r.sensor_radius:.1f}"
+                          for r in model.robots)
+        rows.append(row("sensor radius now", radii))
+    rows += [
+        row("hazards", f"rate {dyn.hazard_rate:g}, size {dyn.hazard_size}, "
+                       f"{dyn.hazard_duration}t"),
+        row("obstacles", f"rate {dyn.obstacle_rate:g}, "
+                         f"max {dyn.max_obstacles}"),
+        row("weather", dyn.weather if dyn.weather_enabled else "off"),
+        row("grid", f"{model.grid.width}×{model.grid.height}, "
+                    f"{len(model.dump_blocks)} dump sites"),
+        row("seed", getattr(model, "_seed", "—")),
+    ]
+    # allocator-specific knobs, only the ones this allocator actually has
+    for key, label in (("max_sharers", "max robots/task"),
+                       ("capacity_affinity", "capacity affinity κ"),
+                       ("enable_switching", "en-route switching"),
+                       ("max_adds_per_round", "bundle adds/round"),
+                       ("min_share", "min share/seat")):
+        if hasattr(a, key):
+            rows.append(row(label, f"`{getattr(a, key)}`"))
+
+    with solara.Details("Current configuration", expand=False):
+        solara.Markdown("| | |\n|---|---|\n" + "\n".join(rows))
 
 
 @solara.component
@@ -369,6 +478,11 @@ def DebugSwitches(model):
                             on_value=toggle(dbg_blocked))
             solara.Checkbox(label="comm links", value=dbg_comms.value,
                             on_value=toggle(dbg_comms))
+            solara.Checkbox(label="lidar", value=dbg_sensor.value,
+                            on_value=toggle(dbg_sensor))
+        solara.Markdown("_pick one robot below to see its **blind spot** "
+                        "(red ×) — cells that are blocked but absent from "
+                        "its map._")
         solara.ToggleButtonsSingle(
             value=dbg_focus.value,
             values=["all"] + [f"R{r.robot_id}" for r in model.robots],
@@ -466,12 +580,24 @@ def DebugPanel(model):
 # ------------------------------------------------------------------ #
 # Assembly
 # ------------------------------------------------------------------ #
+# Must match model_params["allocator"]["value"], or the first frame runs
+# one allocator while the widget claims another -- the same disagreement
+# between the widgets and the live model that the config panel exists to
+# expose.
 model_instance = ExcavationModel(
     seed=23, allocator="moa-cbba",
+<<<<<<< HEAD
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
     hazard_rate=0.05, hazard_size=2, hazard_duration=5,
     obstacle_rate=0.3, max_obstacles=10, weather_enabled=True)
+=======
+    weather_enabled=True, weather_change_rate=0.05,
+    # Phase 4 is off in the model defaults; the dashboard turns it on so
+    # there is something to look at.
+    hazard_rate=0.05, hazard_size=2, hazard_duration=8,
+    obstacle_rate=0.3, max_obstacles=10)
+>>>>>>> 48d0111312f2d2d41477b19b78ffe0960cf34c73
 
 renderer = SpaceRenderer(model_instance, backend="matplotlib")
 renderer.setup_propertylayer(layer_portrayal)
@@ -489,15 +615,48 @@ def _live_model():
     return getattr(space, "model", None) or model_instance
 
 
+def _artist_lists(ax):
+    return (ax.lines, ax.patches, ax.collections, ax.texts)
+
+
 def _clear(ax, tag: str) -> None:
     """Remove every artist this module drew under `tag`. Matplotlib keeps
     lines, patches, collections and texts in separate lists and the
     renderer only clears some of them, so overlays stack up over frames
-    unless each family is swept."""
-    for seq in (ax.lines, ax.patches, ax.collections, ax.texts):
+    unless each family is swept.
+
+    remove() is guarded because it raises on an artist that is already
+    detached, and an exception here leaves the sweep half done -- some
+    overlays cleared, some not -- which is how orphans accumulate."""
+    for seq in _artist_lists(ax):
         for art in list(seq):
-            if getattr(art, "_gid", None) == tag:
+            if getattr(art, "_gid", None) != tag:
+                continue
+            try:
                 art.remove()
+            except (NotImplementedError, ValueError, AttributeError):
+                pass                     # already detached; nothing to do
+
+
+def _purge_orphans(ax) -> None:
+    """Drop artists that are still listed on the axes but no longer
+    attached to a figure.
+
+    Matplotlib dereferences the figure while drawing -- PathCollection
+    does `self.get_figure(root=True).dpi` -- so an orphan is not a
+    cosmetic problem, it is an AttributeError on None that kills the
+    whole render. Solara re-draws the figure from a cached callback
+    while post_process is mutating it, so the two can interleave and
+    leave an artist detached but still listed. Sweeping before drawing
+    costs one pass over a few dozen objects and makes the render
+    unkillable from this direction."""
+    for seq in _artist_lists(ax):
+        for art in list(seq):
+            if getattr(art, "figure", False) is None:
+                try:
+                    art.remove()
+                except Exception:
+                    pass
 
 
 def _focused(robot) -> bool:
@@ -554,11 +713,59 @@ def _draw_blocked(ax, model):
     _clear(ax, "_dbg_blocked")
     if not (dbg_on.value and dbg_blocked.value):
         return
-    for (x, y) in model.blocked_cells():
+    # DYNAMIC blockage only. Hatching everything blocked_cells() returns
+    # meant re-drawing every bedrock ridge and dump block on top of the
+    # terrain layer that already draws them in black and blue -- pure
+    # noise over most of the map. What is worth seeing is the part that
+    # was not there a moment ago and will not be there shortly.
+    for (x, y) in model.dynamics.blocked():
         rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
                              hatch="///", edgecolor="#222222", lw=0.0,
                              alpha=0.45, zorder=7)
         rect._gid = "_dbg_blocked"
+        ax.add_patch(rect)
+
+
+def _draw_sensor(ax, model):
+    """The lidar disc, and — in focus mode — the blind spot.
+
+    With sensing on, a robot plans against `known_blocked()`, not the
+    truth. The gap between those two is the single most useful thing to
+    see on this map and the only one that cannot be inferred from any
+    other overlay: a route that looks reckless is usually a route into a
+    hazard the robot has no way of knowing about yet.
+
+    Solid ring   = current sensing radius (sigma_i x weather scale)
+    Red hatching = truly blocked, NOT in this robot's map (focus mode)
+    """
+    _clear(ax, "_dbg_sensor")
+    if not (dbg_on.value and dbg_sensor.value
+            and getattr(model, "sensing_enabled", False)):
+        return
+    for r in model.robots:
+        if not _focused(r):
+            continue
+        x, y = r.cell.coordinate
+        disc = plt.Circle((x, y), r.sensor_radius, fill=False,
+                          ec=robot_color(r.robot_id), lw=1.0, ls=":",
+                          alpha=0.75, zorder=5)
+        disc._gid = "_dbg_sensor"
+        ax.add_patch(disc)
+
+    # Blind spot only makes sense for ONE robot: with "all" selected the
+    # unknown sets differ per robot and overlaying them means nothing.
+    if dbg_focus.value == "all":
+        return
+    rid = int(dbg_focus.value[1:])
+    robot = next((r for r in model.robots if r.robot_id == rid), None)
+    if robot is None:
+        return
+    unknown = model.dynamics.blocked() - robot.known_blocked()
+    for (x, y) in unknown:
+        rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
+                             hatch="xxx", edgecolor="#c0392b", lw=0.0,
+                             alpha=0.85, zorder=8)
+        rect._gid = "_dbg_sensor"
         ax.add_patch(rect)
 
 
@@ -670,17 +877,21 @@ def fit_canvas(ax):
     carries post_process across Reset, so the size survives resets."""
     ax.set_aspect("equal")
     ax.get_figure().set_size_inches(10.0, 10.0)
-    _draw_selection(ax)
-    _draw_hazards(ax)
-    _draw_obstacles(ax)
 
     model = _live_model()
-    if model is None:
-        return
-    # Overlays must not be able to take the dashboard down: a debug view
-    # that crashes the run it is debugging is worse than no debug view.
+    # EVERY overlay is inside the guard, not just the debug ones. A
+    # dashboard that crashes the run it is meant to observe is worse
+    # than no dashboard, and the three map overlays below were outside
+    # the try block purely by accident of the order they were written.
     try:
+        _purge_orphans(ax)
+        _draw_selection(ax)
+        _draw_hazards(ax)
+        _draw_obstacles(ax)
+        if model is None:
+            return
         _draw_blocked(ax, model)
+        _draw_sensor(ax, model)
         _draw_comms(ax, model)
         _draw_paths(ax, model)
         _draw_targets(ax, model)
@@ -706,11 +917,33 @@ model_params = {
         "label": "allocator",
     },
     "fleet_mode": {
+        # Must match ExcavationModel's own default. SolaraViz passes every
+        # entry in model_params to the constructor on Reset, so a stale
+        # value here silently OVERRIDES the model default -- which is how
+        # this read "capacity" while the code had moved to "full".
         "type": "Select",
-        "value": "capacity",
+        "value": "full",
         "values": ["none", "capacity", "full"],
-        "label": "fleet heterogeneity (Phase 2)",
+        "label": "fleet heterogeneity",
     },
+    "sensing_enabled": {
+        "type": "Checkbox",
+        "value": True,
+        "label": "lidar sensing (off = omniscient)",
+    },
+    "comm_range": Slider("comm range (0 = unlimited)", 10.0, 0.0, 45.0, 1.0),
+    "w1": Slider("w1 (makespan weight)", 1.0, 0.0, 5.0, 0.25),
+    "w2": Slider("w2 (energy weight)", 1.0, 0.0, 5.0, 0.25),
+    "hazard_rate": Slider("hazard rate", 0.0, 0.0, 0.5, 0.05),
+    "obstacle_rate": Slider("obstacle rate", 0.0, 0.0, 0.6, 0.05),
+    "weather_enabled": {
+        "type": "Checkbox", "value": True, "label": "weather",
+    },
+    # Enabling weather with rate 0 leaves it on "clear" forever, and
+    # clear has sensor_scale = traction_scale = 1.0 -- i.e. the switch
+    # appears on and does precisely nothing.
+    "weather_change_rate": Slider("weather change rate", 0.05, 0.0, 0.3, 0.01),
+    "bedrock_ridges": Slider("bedrock ridges", 6, 0, 15, 1),
     "width": 32,
     "height": 32,
 }

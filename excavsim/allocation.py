@@ -28,6 +28,21 @@ diverged from the paper and are fixed:
      stamped the round index, mergeTimestamps stamped model.tick -- so
      newer(m) compared incomparable numbers. One monotone counter now
      serves both, incremented once per auction round for the whole run.
+
+New-reader primer: an "allocator" answers the question "which robot
+should do which task?" every tick. The simplest one, GreedyAllocator,
+just has each free robot grab the cheapest job it can see -- no
+negotiation. CBBA (Consensus-Based Bundle Algorithm) is more
+sophisticated: each robot privately builds a "bundle" (wish-list) of
+tasks it wants, in the order that maximises its own reward, then robots
+gossip their current best claims to each other over several
+communication rounds until they all agree (converge) on who owns what,
+with conflicts resolved by "Table I" (the decision rules in
+`_CBBADecisionTable`, straight out of the Choi/Brunet/How 2009 paper).
+This file wires that up: CBBAAgent is the per-robot brain, CBBAAllocator
+drives every robot's brain through one auction each time it's
+triggered. CBPAE and MOA-CBBA (their own files) plug into this same
+"allocate(model)" interface with different bidding strategies.
 """
 
 from __future__ import annotations
@@ -123,11 +138,36 @@ class Allocator:
 
 class GreedyAllocator(Allocator):
     """Each idle robot takes the cheapest pending task, in shuffled
-    order. Cost convention: lower bid wins."""
+    order. Cost convention: lower bid wins.
+
+    The no-coordination baseline. There is no bidding table, no
+    messaging and no consensus: robots simply claim tasks one after
+    another, and because claiming is immediate, whoever goes first gets
+    first pick. Robot order is shuffled each tick so that advantage does
+    not always fall to robot 0.
+
+    This is myopic in two ways worth naming, since they are exactly what
+    the real algorithms fix: each robot considers only its NEXT task (no
+    lookahead over a sequence), and no robot ever reconsiders a choice in
+    light of what another robot wants.
+    """
 
     name = "greedy"
 
     def allocate(self, model) -> None:
+        """Assign every idle robot its cheapest reachable pending task.
+
+        MATH: for each robot, bid_value = w1*tau + w2*E for every pending
+        task (bidding.bid_value), sorted ascending; the robot takes the
+        first one assign() accepts. Infeasible tasks (+inf) are dropped
+        before sorting.
+
+        Trying tasks in cost order rather than just taking the argmin
+        matters because assign() can refuse (no free dig cell, no
+        reachable dump), in which case the next-cheapest is tried.
+
+        CALLED BY: model.step, once per tick, via model.allocator.
+        """
         idle = [r for r in model.robots if r.task_id is None]
         model.random.shuffle(idle)
         for robot in idle:
@@ -149,8 +189,37 @@ class GreedyAllocator(Allocator):
 # ------------------------------------------------------------------ #
 def pathScoreCBBA(model, robot, path, lam: float = LAMBDA,
                   task_reward: float = TASK_REWARD) -> float:
-    """S_i^{p_i}, Choi et al. Eq. (11), instantiated for Eq. (1) of the
-    proposal.
+    """How much REWARD a robot earns by executing `path` in order.
+
+    MATH -- Choi et al. Eq. (11), a time-discounted reward. Walk the path
+    in order, accumulating cost, and add a discounted reward per task:
+
+        clock_k = sum over the first k tasks of (w1*tau + w2*E)
+        S(path) = sum over k of  task_reward * lambda^(clock_k)
+
+    with lambda = 0.99 < 1, so a task reached later is worth
+    exponentially less. Each leg starts where the previous one dumped
+    (startPos = the previous q*), which is what makes ORDER matter and
+    the score a property of the whole sequence rather than a sum of
+    independent tasks.
+
+    An infeasible path (any leg unreachable) scores NOBID = 0.
+
+    WHY THESE TWO PROPERTIES MATTER (both are load-bearing for CBBA's
+    convergence proof, and both survive the change described below):
+      - NON-NEGATIVE: every term is task_reward * lambda^cost > 0, so
+        Sec. IV-A's assumption c_ij >= 0 holds and adding a task always
+        yields a strictly positive gain. Marginal gains cannot go
+        negative.
+      - DIMINISHING MARGINAL GAIN (DMG, Eq. 7): inserting a task pushes
+        every LATER task further out in clock terms, so each existing
+        term can only shrink -- the Eq. (12) triangle-inequality
+        argument with cost in place of time. Hence the more tasks a
+        robot already holds, the less an additional one is worth to it,
+        which is what stops one robot hoarding the whole board.
+
+    CALLED BY: CBBAAgent._pathScore, which createBundle uses to price
+    every candidate insertion.
 
     The paper discounts by ARRIVAL TIME alone. We discount by the
     accrued objective w1*tau + w2*E, so that the reward CBBA maximises
@@ -188,6 +257,16 @@ class CBBAAgent:
 
     State per Sec. IV-A: bundle b_i, path p_i, winning bids y_i,
     winning agents z_i, timestamps s_i.
+
+    One instance of this lives on each robot (robot.CBBA). "Bundle" is
+    the set of tasks this robot has claimed, in the order it added them;
+    "path" is the same tasks reordered for cheapest execution. y/z/s are
+    this robot's current BELIEFS about the whole auction: for every
+    task, who it thinks currently has the winning bid (z), what that bid
+    is (y), and how fresh that information is (s) -- these three get
+    broadcast to neighbours and reconciled against what they broadcast
+    back, which is how the fleet reaches agreement without a central
+    coordinator.
     """
 
     def __init__(self):
@@ -200,19 +279,39 @@ class CBBAAgent:
         self._score_memo: dict[int, float] = {}   # Lemma 4 clamp
 
     def _bid(self, task_id) -> float:
+        """y_ij: the best bid I currently believe exists on task j.
+        Defaults to NOBID (0.0) for a task nobody has bid on."""
         return self.winningBidList.get(task_id, NOBID)
 
     def _winner(self, task_id):
+        """z_ij: who I currently believe holds task j (None = nobody)."""
         return self.winningAgentList.get(task_id, None)
 
     def _stamp(self, agent_id) -> int:
+        """s_im: how fresh my information about robot m is. Defaults to
+        -1, i.e. "I have never heard anything about m", which loses every
+        freshness comparison in Table I."""
         return self.timeStamp.get(agent_id, -1)
 
     # -------------------------------------------------------------- #
     # communication
     # -------------------------------------------------------------- #
     def broadcast(self, robot, now: int) -> None:
-        """Broadcast (y, z, s) to neighbours."""
+        """Tell my neighbours everything I believe: the full (y, z, s)
+        triple.
+
+        Stamps my own entry in s with `now` first -- my information about
+        myself is always current. Copies are sent (dict(...)), and
+        comms.send deep-copies again, so no receiver can alias my state.
+
+        MESSAGE SIZE: O(number of tasks), since y and z carry an entry
+        per task. Contrast CBPAE, which broadcasts exactly four tasks and
+        is therefore constant-size -- that difference is the bandwidth
+        argument in the CBPAE paper.
+
+        CALLED BY: CBBAAllocator.allocate, once per robot per auction
+        round, immediately after createBundle.
+        """
         self.timeStamp[robot.robot_id] = now
         robot.send({
             "sender": robot.robot_id,
@@ -222,8 +321,25 @@ class CBBAAgent:
         })
 
     def mergeTimestamps(self, sender_id: int, other_s: dict, now: int) -> None:
-        """Eq. (5): s_ik = tau_r for a direct neighbour k, and
-        max over neighbours m of s_mk for everyone else.
+        """Update my freshness vector s after hearing from robot k.
+
+        MATH -- Eq. (5), two cases:
+
+            s_ik = now                        (k is a direct neighbour:
+                                               I just heard from it)
+            s_im = max(s_im, s_km)  for m!=k  (everyone else: take
+                                               whichever of us has
+                                               fresher news about m)
+
+        This is how information about DISTANT robots propagates through a
+        multi-hop network: I learn about robot m not from m, but from a
+        neighbour who heard about it more recently than I did. The
+        element-wise max is what makes freshness monotone and lets
+        Table I distinguish new information from a stale echo.
+
+        CALLED BY: resolveConflicts, once per message, AFTER the decision
+        table has run -- so the table compares the sender's s_k against
+        my PRE-merge s_i.
 
         This was the missing half of the consensus. Without it every
         s_im stayed at its -1 default, `newer(m)` in the decision table
@@ -244,7 +360,39 @@ class CBBAAgent:
     def _CBBADecisionTable(self, i, k, j, y_k, z_k, s_k) -> str:
         """Table I: receiver i's action on task j after hearing from k.
 
-        Returns "update", "reset" or "leave" (the default).
+        THE CORE OF CBBA CONSENSUS. Two robots disagree about who holds
+        task j; this decides, using only local information, what receiver
+        i should do. Every robot applies the identical rule set, which is
+        what makes the fleet converge without a coordinator.
+
+        Returns one of three actions:
+          "update" -- adopt the sender's (y, z) for this task
+          "reset"  -- clear my entry; nobody holds it as far as I know
+          "leave"  -- keep mine unchanged (the default)
+
+        STRUCTURE: the table is indexed by two things -- who the SENDER
+        thinks won (z_kj) and who *I* think won (z_ij) -- giving four
+        blocks of cases, each split by the identity of the believed
+        winner (the sender itself, me, nobody, or some third robot m):
+
+            z_kj = k      (sender claims it)
+            z_kj = i      (sender thinks I hold it)
+            z_kj = None   (sender thinks it is free)
+            z_kj = m      (sender thinks a third robot holds it)
+
+        Within a block the tie-breakers are two predicates defined just
+        below: `newer(m)` -- is the sender's information about m fresher
+        than mine (s_km > s_im)? -- and `better()` -- does the sender's
+        bid beat mine (bidding._better_bid: higher reward wins, ties to
+        the lower robot id)?
+
+        The general principle: adopt the sender's view when it is either
+        better-informed (newer) or objectively better (a stronger bid),
+        and otherwise keep mine. The "reset" cases exist for when neither
+        of us can be trusted -- e.g. the sender says I hold a task I
+        believe someone else holds, so both beliefs are stale.
+
+        CALLED BY: resolveConflicts, once per (message, task) pair.
         """
         zk = z_k.get(j)          # who the sender thinks won j
         zi = self._winner(j)     # who I think won j
@@ -314,13 +462,32 @@ class CBBAAgent:
     # Eq. (6)
     # -------------------------------------------------------------- #
     def _releaseOutbid(self, i, locked=None) -> bool:
-        """Eq. (6): if a task is outbid, everything added to the bundle
-        after it must be released too, because removing b_{i,n_bar}
-        changes the marginal score of every ensuing task.
+        """Drop every task from the first one I have LOST onwards.
+
+        MATH -- Eq. (6). Let n_bar be the position of the first task in
+        my bundle whose winner is no longer me. Then:
+
+            release b_i[n] for all n >= n_bar
+
+        The tail must go, not just the lost task. Bundle order encodes
+        the order tasks were added, and each task's bid was computed as a
+        MARGINAL gain given everything before it. Remove one, and every
+        later task's bid was priced against a schedule that no longer
+        exists -- so those bids are meaningless and must be recomputed
+        from scratch next round.
+
+        Subtlety kept faithful to the paper: b_i[n_bar] itself keeps its
+        (losing) y/z, since consensus has already decided that entry;
+        only the entries strictly AFTER it that I still hold get reset.
 
         `locked` is the task currently under execution; it can never be
         released (the robot is physically standing in the hole), so the
-        scan starts after it.
+        scan skips it.
+
+        RETURNS True if anything was released, which the caller reports
+        as "something changed, we have not converged yet".
+
+        CALLED BY: resolveConflicts, after all messages are processed.
         """
         n_bar = None
         for n, task_id in enumerate(self.bundle):
@@ -387,13 +554,28 @@ class CBBAAgent:
         return pathScoreCBBA(model, robot, path)
 
     def _clamped_gain(self, task_id: int, raw: float) -> float:
-        """Lemma 4: c_ij(t) = min(c_ij_raw(t), c_ij(t-1)).
+        """Force a task's marginal gain to never INCREASE across the
+        rounds of one auction.
 
-        The paper proves CBBA converges to a conflict-free assignment
-        within N_min*D iterations for ANY scoring scheme, DMG or not,
-        provided the scores are made monotonically non-increasing over
-        iterations this way. Reset once per auction episode, since the
-        proof is over the iterations of one episode.
+        MATH -- Lemma 4:
+
+            c_ij(t) = min( c_ij_raw(t),  c_ij(t-1) )
+
+        i.e. remember the lowest gain ever computed for this task this
+        auction, and use that. A bid can therefore only ever fall.
+
+        WHY: the paper proves CBBA converges to a conflict-free
+        assignment within N_min*D iterations for ANY scoring scheme, DMG
+        or not, PROVIDED scores are made monotonically non-increasing
+        this way. Since pathScoreCBBA is already DMG this is
+        belt-and-braces, but it costs one dict lookup and removes any
+        dependence of termination on the scoring function's properties.
+
+        The memo (`_score_memo`) is reset once per auction episode by
+        CBBAAllocator.allocate, because the guarantee is over the
+        iterations of a single episode, not the whole run.
+
+        CALLED BY: createBundle, for every candidate task considered.
         """
         prev = self._score_memo.get(task_id, INF)
         c = min(raw, prev)
@@ -401,10 +583,43 @@ class CBBAAgent:
         return c
 
     def createBundle(self, model, robot):
-        """Algorithm 3. Operates on self.bundle / self.path directly --
-        the old signature took y/z/bundle as arguments and then
-        reassigned the members anyway, which is what the note in the
-        original file was complaining about."""
+        """PHASE 1 of CBBA: greedily grow this robot's wish-list of tasks.
+
+        MATH -- Algorithm 3. Repeat until the bundle is full (|b_i| =
+        L_t) or nothing qualifies:
+
+          1. Score the current path:   S = pathScore(p_i)
+          2. For every task j not in the bundle, try inserting it at
+             EVERY position n in the path and keep the best:
+                 c_ij = max over n of [ pathScore(p_i +_n j) - S ]
+             (+_n means "insert at position n"). Trying all positions is
+             what makes this a bundle algorithm rather than a queue --
+             a new task can be slotted into the middle of an existing
+             route if that is cheapest.
+          3. Clamp the gain (Lemma 4, _clamped_gain).
+          4. Admit j only if  c_ij > 0  AND  c_ij > y_ij  (Eq. 4's
+             indicator h_ij) -- it must be worth something to me AND beat
+             the best bid I currently believe exists.
+          5. Take the single best qualifying task, append it to the
+             bundle, insert it in the path at its best position, and
+             record myself as the winner at bid c_ij.
+
+        Note bundle and path are different orderings of the same set:
+        the bundle records the ORDER TASKS WERE ADDED (which Eq. 6 needs
+        when releasing a tail), the path records the ORDER THEY WILL BE
+        EXECUTED.
+
+        The task under execution is re-stamped with LOCKED_BID at the end
+        so no other robot can take a task this robot is standing in.
+
+        CALLED BY: CBBAAllocator.allocate, once per robot per auction
+        round.
+
+        Operates on self.bundle / self.path directly -- the old signature
+        took y/z/bundle as arguments and then reassigned the members
+        anyway, which is what the note in the original file was
+        complaining about.
+        """
         tag = f"[R{robot.robot_id}]"
         locked = robot.task_id
         known_ids = [t.task_id for t in self.task_list]
@@ -496,8 +711,23 @@ class CBBAAgent:
     # Phase 2: conflict resolution (Algorithm 2 + Table I)
     # -------------------------------------------------------------- #
     def resolveConflicts(self, robot, receivedMessages, now: int) -> bool:
-        """Returns True if anything changed, i.e. another round is
-        needed before the fleet has converged.
+        """PHASE 2 of CBBA: reconcile my beliefs against what I just heard.
+
+        For every message, for every task either of us knows about, ask
+        _CBBADecisionTable what to do and apply it (update / reset /
+        leave). Then merge freshness stamps (Eq. 5), and finally run
+        _releaseOutbid (Eq. 6) to drop any tail of the bundle I have lost.
+
+        Returns True if anything changed, i.e. another round is
+        needed before the fleet has converged. The allocator loops
+        phase 1 + phase 2 until every robot returns False (converged) or
+        the round bound is hit.
+
+        Tasks under execution are skipped entirely -- a robot physically
+        standing in a hole cannot have that task voted away from it.
+
+        CALLED BY: CBBAAllocator.allocate, once per robot per round,
+        after the round's messages have been delivered.
 
         `now` is the auction clock, and it MUST be the same one
         broadcast() stamps with. It used to read model.tick here while
@@ -562,7 +792,20 @@ class CBBAAgent:
     def prune(self, model, robot) -> None:
         """Drop finished tasks, and tasks another robot is executing,
         from the bundle and path. With persistent bundles this is what
-        keeps them from accumulating stale ids forever."""
+        keeps them from accumulating stale ids forever.
+
+        Bundles now survive across ticks (that is what makes this CBBA
+        rather than CBAA), so without this housekeeping step a robot's
+        wish-list would fill up with tasks that no longer exist or that
+        somebody else is already digging, and its bundle_limit would be
+        consumed by ghosts.
+
+        Also calls _releaseStaleLocks first, to give back any
+        LOCKED_BID that outlived the execution it was protecting.
+
+        CALLED BY: CBBAAllocator.allocate, once per robot at the start of
+        each auction, before bidding begins.
+        """
         self._releaseStaleLocks(robot)
         keep = []
         for task_id in self.bundle:
@@ -605,12 +848,26 @@ class CBBAAllocator(Allocator):
         self._clock = 0
 
     def _trigger(self, model, robots, open_tasks):
-        """Re-auction only on a change in the situation: a robot freed
+        """Should an auction run this tick at all?
+
+        Computes a SIGNATURE of the current situation -- which robots are
+        idle, which tasks are open, and whether the terrain changed --
+        and re-auctions only when it differs from last time or the fleet
+        has not yet converged:
+
+            sig = (frozenset of idle robot ids,
+                   frozenset of open task ids,
+                   did any cell change this tick)
+
+        Re-auction only on a change in the situation: a robot freed
         up, a task finished, or the terrain moved (Algorithm 1 lines
         3-7). Holding a converged assignment between changes is the
         point of a time-extended allocation -- re-running the auction
         every tick would both burn A* calls and churn bundles that
-        nothing has invalidated."""
+        nothing has invalidated.
+
+        CALLED BY: allocate, at the top of every tick.
+        """
         sig = (frozenset(r.robot_id for r in robots if r.task_id is None),
                frozenset(t.task_id for t in open_tasks),
                bool(model.changed_cells))
@@ -620,6 +877,41 @@ class CBBAAllocator(Allocator):
         return True
 
     def allocate(self, model) -> None:
+        """Run one full CBBA auction and start whoever won something.
+
+        THE MAIN LOOP OF CBBA, in four stages:
+
+          SETUP     -- prune stale bundle entries, refresh each robot's
+                       candidate task list, clear the Lemma-4 memo, and
+                       drop any stale inbox contents.
+          ROUNDS    -- repeat up to max_rounds times:
+                         every robot: createBundle (phase 1: bid)
+                         every robot: broadcast
+                         deliver messages
+                         every robot: resolveConflicts (phase 2: agree)
+                       and stop early the first round in which NO robot
+                       reports a change -- that is convergence.
+          EXECUTE   -- each idle robot takes the first task in its path
+                       that it still owns. The REST of the bundle is
+                       kept, which is the entire point of a bundle
+                       algorithm: the robot has already planned its next
+                       few jobs.
+
+        MATH -- the round budget comes from Theorem 1, which bounds
+        convergence at N_min * D iterations:
+
+            L_t       = max bundle limit across the fleet
+            N_min     = min( |open tasks|, |robots| * L_t )
+            max_rounds= min( ROUND_CEILING, max(2, N_min * D) )
+
+        where D is the comm graph diameter (comms.network_diameter): on a
+        multi-hop network information needs D rounds to cross the fleet,
+        so the bound scales with it. The floor of 2 exists because
+        convergence is DEFINED as "a round in which nothing changed", so
+        a budget of 1 could never report it.
+
+        CALLED BY: model.step, once per tick, via model.allocator.
+        """
         robots = model.robots
         open_tasks = [t for t in model.tasks.unfinished]
         if not robots or not open_tasks:

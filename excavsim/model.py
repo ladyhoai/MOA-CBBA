@@ -9,6 +9,16 @@
 
 Every run is seeded (Mesa passes `seed` to a per-model RNG), so batch
 experiments are reproducible.
+
+New-reader primer: ExcavationModel is the top-level object for one
+simulation run -- everything else (the grid, the robots, the tasks, the
+communication network, the chosen allocator) is built and owned here.
+If you're trying to understand "how does a run start and what happens
+each tick", read `__init__` (builds the world once) and `step` (what
+happens on every subsequent tick) below. Mesa's Model/CellAgent classes
+provide the simulation "clock": `model.step()` is called repeatedly
+(by run(), or by mesa.batch_run, or by the GUI's Play button) until
+`self.running` becomes False.
 """
 
 from __future__ import annotations
@@ -24,7 +34,8 @@ _register_moacbba()
 from .comms import CommNetwork
 from .costs import RobotSpec, objective
 from .fleet import ROBOT_CLASSES, build_fleet, fleet_summary
-from .pathfinding import nearest_work_cell, nearest_work_path, work_candidates
+from .pathfinding import (_squeezes, nearest_work_cell, nearest_work_path,
+                          work_candidates)
 from .robot import ExcavatorRobot
 from .tasks import TaskRegistry
 from .terrain import T_UNLOAD, Terrain
@@ -93,6 +104,12 @@ class ExcavationModel(Model):
         # (a dead RobotSpec field until now) and the weather sensor_scale
         # (computed and only ever displayed) both start doing work.
         sensing_enabled: bool = True,
+        # Phase 3 sensing. False = the old omniscient behaviour, where
+        # every robot sees every hazard the tick it appears. True makes a
+        # robot plan against what its OWN sensor has found, so sigma_i
+        # (a dead RobotSpec field until now) and the weather sensor_scale
+        # (computed and only ever displayed) both start doing work.
+        sensing_enabled: bool = True,
         comm_range: float | None = 10.0,
         packet_loss: float = 0.0,
         comm_latency: int = 0,
@@ -155,7 +172,7 @@ class ExcavationModel(Model):
         # feeds a leg cost can change inside a round.
         self._leg_cache: dict = {}
         self.changed_cells: set[Coord] = set()  # Algorithm 1, line 3 hook
-        print("Allocator used: ", allocator)
+        # print("Allocator used: ", allocator)
 
         # --- grid and property layers ---------------------------------- #
         self.grid = OrthogonalMooreGrid((width, height), torus=False,
@@ -219,6 +236,11 @@ class ExcavationModel(Model):
         # --- Phase 6 communication layer (neutral by default) ----------- #
         # Change comm_range to a number so that the s vector is utilised
 
+        # The GUI slider cannot express None, so it sends 0 for
+        # "unlimited". Anything <= 0 would otherwise mean a robot can
+        # hear nobody at all, which silently disables consensus.
+        if comm_range is not None and comm_range <= 0:
+            comm_range = None
         self.comms = CommNetwork(self, comm_range=comm_range,
                                  packet_loss=packet_loss,
                                  latency=comm_latency,
@@ -279,9 +301,21 @@ class ExcavationModel(Model):
 
     # -------------------------------------------------------------------- #
     def step(self) -> None:
+        """One simulated tick, in order: age the world (hazards/obstacles/
+        weather) -> deliver any messages sent last round -> let robots
+        sense their surroundings -> run the allocator (bidding +
+        consensus, may assign idle robots to tasks) -> let every robot
+        execute one tick of movement/digging/unloading -> record metrics
+        -> stop the run if every task is finished."""
         self.tick += 1
         self.dynamics.step(self.tick)
         self.comms.flush_and_deliver(self.tick)    # in-flight messages land
+
+        # Sense BEFORE bidding: a bid priced on a stale occupancy map is
+        # a bid the robot cannot execute, which breaks the
+        # bid == execution invariant the whole cost model rests on.
+        for r in self.robots:
+            r.sense()
 
         # Sense BEFORE bidding: a bid priced on a stale occupancy map is
         # a bid the robot cannot execute, which breaks the
@@ -328,42 +362,90 @@ class ExcavationModel(Model):
     # -------------------------------------------------------------------- #
     @property
     def makespan(self) -> int:
-        """max_i busy time; equals last task completion for a full run."""
+        """When the LAST task finished -- the run's total duration.
+
+        MATH: max over tasks of completed_tick. That is the
+        max_i sum_j x_ij tau_ij term of Eq. (1): the slowest robot's
+        total workload sets the finish time, and the last completion
+        stamp is when that robot finished.
+
+        Only STAMPED tasks count, and a task is stamped only once its
+        material has actually reached a dump (robot._stamp_if_complete),
+        so this cannot report a finish while a robot is still hauling.
+        Falls back to the current tick when nothing has completed yet.
+
+        CALLED BY: current_objective, run_single.py, batch30.py and the
+        GUI's metrics panel.
+        """
         done = [t.completed_tick for t in self.tasks.all
                 if t.completed_tick is not None]
         return max(done) if done else self.tick
 
     def current_objective(self) -> float:
-        """J(x) as in Eq. (1) — the primary comparison metric."""
+        """J(x) as in Eq. (1) — the primary comparison metric.
+
+        MATH:  J = w1 * makespan + w2 * sum_i energy_used_i
+
+        See costs.objective for the formula and why the two halves behave
+        differently (sum vs. max). This is THE number the three
+        allocators are compared on.
+
+        CALLED BY: run_single.py, batch30.py, the GUI, and the
+        reproducibility test in tests/test_costs.py.
+        """
         return objective(self.makespan,
                          sum(r.energy_used for r in self.robots),
                          self.w1, self.w2)
 
     #### COULD BE DEPRECATED BECAUSE DUMP_WORK_PATH EXISTS
     def dump_work_cell(self, coord: Coord,
-                       occupied: set[Coord] | None = None):
+                       occupied: set[Coord] | None = None,
+                       blocked: set[Coord] | None = None):
         """Nearest unload position: a traversable cell adjacent to any
         dump block, chosen deterministically. Returns (cell, dist) or
         None. Pass `occupied` to exclude/avoid other robots; omit it for
-        uncontended cost estimates (bids)."""
+        uncontended cost estimates (bids).
+
+        `blocked` lets a caller plan on ITS OWN map. Without it the haul
+        leg was planned omnisciently while the approach leg used the
+        robot's sensed map, so a robot was blind to hazards on the way to
+        the dig site but knew every hazard on the way to the dump -- and
+        the haul is the larger leg, walked n = ceil(V/C) times.
+
+        HOW: there are several 2x2 dump blocks on the map, so it runs
+        nearest_work_cell once per block and keeps the closest result.
+        This is the q* of the cost model.
+
+        CALLED BY: robot.assign (pick q* at assignment), robot._go_dump
+        (pick one if none was set) and robot._reroute (pick a fresh one
+        when stuck).
+        """
         best = None
+        known = self.blocked_cells() if blocked is None else blocked
         for block in self.dump_blocks:
             found = nearest_work_cell(coord, block, self.grid.width,
-                                      self.grid.height,
-                                      self.blocked_cells(), occupied)
+                                      self.grid.height, known, occupied)
             if found and (best is None or found[1] < best[1]):
                 best = found
         return best
     
     def dump_work_path(self, coord: Coord,
-                       occupied: set[Coord] | None = None):
+                       occupied: set[Coord] | None = None,
+                       blocked: set[Coord] | None = None):
         """Like dump_work_cell, but also returns the route, so callers
-        can measure elevation gain. Returns (cell, dist, path) or None."""
+        can measure elevation gain. Returns (cell, dist, path) or None.
+
+        The route matters because costs.energy_ij charges for elevation
+        GAINED along the haul (both directions), which cannot be
+        recovered from the endpoints alone.
+
+        CALLED BY: bidding.leg_cost, for the haul leg of every bid.
+        """
         best = None
+        known = self.blocked_cells() if blocked is None else blocked
         for block in self.dump_blocks:
             found = nearest_work_path(coord, block, self.grid.width,
-                                      self.grid.height,
-                                      self.blocked_cells(), occupied)
+                                      self.grid.height, known, occupied)
             if found and (best is None or found[1] < best[1]):
                 best = found
         return best
@@ -376,7 +458,15 @@ class ExcavationModel(Model):
         `where` scan on every blocked_cells() call, which is several
         times per A* and thousands of times per auction round. Call
         invalidate_static_blocked() if terrain types ever become
-        mutable (e.g. if bedrock is added at runtime)."""
+        mutable (e.g. if bedrock is added at runtime).
+
+        Uses a vectorised numpy `where` over the terrain layer to find
+        every BEDROCK or DUMP_SITE cell in one pass, then caches the set.
+
+        CALLED BY: blocked_cells, robot.known_blocked (the static half of
+        a robot's belief), robot._wait_blocked and
+        dynamics._random_zone.
+        """
         if self._static_blocked_cache is None:
             t = self.grid.terrain.data
             xs, ys = np.where((t == int(Terrain.BEDROCK))
@@ -385,22 +475,50 @@ class ExcavationModel(Model):
         return self._static_blocked_cache
 
     def invalidate_static_blocked(self) -> None:
+        """Force _static_blocked to rebuild on its next call. Call this
+        if terrain TYPES are ever mutated after setup."""
         self._static_blocked_cache = None
 
     def blocked_cells(self) -> set[Coord]:
-        """Impassable cells: bedrock and dump blocks. Phase 4 adds
-        hazards and dynamic obstacles here.
-        
+        """GROUND TRUTH of what is impassable right now.
+
+        MATH:  (static_blocked  U  dynamics.blocked())  -  robot cells
+
+        i.e. permanent obstacles (bedrock, dumps) plus current hazards
+        and obstacles, minus any cell a robot is standing on.
+
         A cell a robot currently OCCUPIES is never reported as blocked,
         even if a hazard grew over it — otherwise a robot caught inside a
         new zone could never path out. It can leave; it just can't be
-        newly routed in"""
+        newly routed in.
+
+        NOTE the contrast with robot.known_blocked(), which is one
+        robot's BELIEF. This method is omniscient, so with sensing
+        enabled it is used only for physics and setup, never for a
+        robot's own planning or bidding.
+
+        CALLED BY: dump_work_cell/dump_work_path (when no map is passed),
+        dynamics._wander / _free_cell, MOACBBAAllocator.seats_for, and
+        robot.known_blocked when sensing is disabled.
+        """
 
         occupied = {r.cell.coordinate for r in self.robots}
         return (self._static_blocked() | self.dynamics.blocked()) - occupied
 
     def _place_dump_block(self) -> None:
-        """Stamp a 2x2 DUMP_SITE block at a random free corner."""
+        """Stamp a 2x2 DUMP_SITE block at a random free corner.
+
+        Rejection sampling: pick a random top-left corner (bounded to
+        w-1/h-1 so all four cells fit on the grid) and accept it if no
+        cell already belongs to another dump. Gives up after 500 tries
+        with an explicit error rather than looping forever.
+
+        Dump cells are impassable, so robots unload from a cell ADJACENT
+        to a block rather than standing on one -- that adjacent cell is
+        the q* of the cost model.
+
+        CALLED BY: __init__, in a loop until 2 blocks are placed.
+        """
         w, h = self.grid.width, self.grid.height
         for _ in range(500):
             cx = self.random.randrange(w - 1)
@@ -418,6 +536,19 @@ class ExcavationModel(Model):
 
     # -------------------------------------------------------------------- #
     def _scatter_terrain(self, rock_frac: float, gravel_frac: float) -> None:
+        """Randomise each cell's terrain type independently.
+
+        MATH: draw u ~ Uniform(0,1) per cell and bucket it --
+            u < rock_frac                        -> ROCK
+            rock_frac <= u < rock+gravel_frac    -> GRAVEL
+            otherwise                            -> SOIL (the default)
+        so the fractions are literally the expected proportion of each
+        type. This is uncorrelated noise, not clustered geology: it
+        varies dig COST cell by cell but creates no regions. Regions come
+        from _scatter_bedrock instead.
+
+        CALLED BY: __init__, during world setup.
+        """
         for x in range(self.grid.width):
             for y in range(self.grid.height):
                 u = self.random.random()
@@ -434,6 +565,20 @@ class ExcavationModel(Model):
         tasks behind a wall are unreachable, robots stall forever and the
         run never terminates. Each ridge is therefore committed only if
         every free cell is still reachable from every other.
+
+        HOW: pick a random start cell and one of four directions
+        ((1,0), (0,1), (1,1), (1,-1) -- horizontal, vertical and both
+        diagonals), walk `length` cells stamping BEDROCK, then test
+        connectivity with _free_space_connected and undo the whole ridge
+        if it severed the map. Repeat n_ridges times.
+
+        WHY RIDGES rather than scattered noise: lines create REGIONS, and
+        regions are what make which robot gets which task matter by a
+        factor rather than a few percent. On an open plain every robot
+        can reach every task at roughly equal cost, and no allocator can
+        distinguish itself from another.
+
+        CALLED BY: __init__, during world setup.
         """
         if n_ridges <= 0 or length <= 0:
             return
@@ -456,33 +601,85 @@ class ExcavationModel(Model):
     def _free_space_connected(self) -> bool:
         """Flood fill over non-bedrock cells; True if they are one
         component. Dump blocks are placed later and are only 2x2, so
-        bedrock is the only thing that can realistically sever the map."""
+        bedrock is the only thing that can realistically sever the map.
+
+        MATH: depth-first flood fill from an arbitrary free cell, then
+        compare |visited| against |free|. Equal means every free cell is
+        reachable from every other -- one connected component.
+
+        CRITICAL: the fill must use the SAME connectivity rule as the
+        planner, including the no-diagonal-squeeze rule (_squeezes), or
+        it will certify a ridge as passable that A* considers a wall, and
+        _scatter_bedrock will happily commit a map robots cannot cross.
+
+        CALLED BY: _scatter_bedrock, after each candidate ridge.
+        """
         w, h = self.grid.width, self.grid.height
         rock = int(Terrain.BEDROCK)
         free = [(x, y) for x in range(w) for y in range(h)
                 if self.grid.terrain.data[x, y] != rock]
         if not free:
             return False
+        # The flood fill MUST use the same connectivity rule as A*, or it
+        # accepts ridges that look connected to it and are impassable to
+        # a robot. Before the no-squeeze rule the two agreed by accident;
+        # now the fill has to refuse diagonal steps between two rocks
+        # exactly as the planner does, or _scatter_bedrock will happily
+        # commit a ridge that severs the map.
+        solid = {(x, y) for x in range(w) for y in range(h)
+                 if self.grid.terrain.data[x, y] == rock}
         seen = {free[0]}
         stack = [free[0]]
         while stack:
             cx, cy = stack.pop()
             for ddx in (-1, 0, 1):
                 for ddy in (-1, 0, 1):
+                    if ddx == ddy == 0:
+                        continue
                     n = (cx + ddx, cy + ddy)
-                    if (0 <= n[0] < w and 0 <= n[1] < h and n not in seen
-                            and self.grid.terrain.data[n[0], n[1]] != rock):
-                        seen.add(n)
-                        stack.append(n)
+                    if not (0 <= n[0] < w and 0 <= n[1] < h):
+                        continue
+                    if n in seen or n in solid:
+                        continue
+                    if _squeezes((cx, cy), ddx, ddy, solid):
+                        continue
+                    seen.add(n)
+                    stack.append(n)
         return len(seen) == len(free)
 
     def _scatter_elevation(self, octaves: int, persistence: float, height_scale: float) -> None:
+        """Generate the elevation layer as fractal (Perlin) noise.
+
+        MATH -- fractal Brownian motion: sum several layers ("octaves")
+        of Perlin noise, each at double the previous frequency
+        (lacunarity = 2) and a fraction of its amplitude
+        (persistence = 0.5). The result is terrain that has both broad
+        hills and fine detail, unlike single-frequency noise:
+
+            field = sum over k of  persistence^k * noise(lacunarity^k * x)
+
+        Then it is normalised to [0, 1] (subtract the min, divide by the
+        peak) and multiplied by height_scale to give metres.
+
+        The padding arithmetic exists because generate_fractal_noise_2d
+        requires dimensions divisible by res * lacunarity^(octaves-1);
+        `-(-w // block) * block` is the integer-ceiling idiom for
+        rounding w up to the next multiple of `block`, and the result is
+        cropped back to [:w, :h].
+
+        Elevation feeds the GAMMA climb terms of costs.energy_ij --
+        higher relief means route choice matters more, since a short
+        path over a ridge can cost more than a long path around it.
+
+        CALLED BY: __init__, during world setup. height_scale <= 0
+        leaves the map perfectly flat.
+        """
         if height_scale <= 0.0:
             return
         w, h = self.grid.width, self.grid.height
         res, lacunarity = 2, 2 # fractal parameters
         block = res * lacunarity ** (octaves - 1) # Required noise size
-        
+
         # Round up to the nearest multiple of "block"
         pw = -(-w // block) * block
         ph = -(-h // block) * block
@@ -498,14 +695,38 @@ class ExcavationModel(Model):
         self.grid.elevation.data[:, :] = height_scale * field
 
 
-    def claimed_work_cells(self, exclude=None) -> set[Coord]:
+    def claimed_work_cells(self, exclude=None, observer=None) -> set[Coord]:
         """Work cells other robots have already committed to. Passed to
         nearest_work_cell at assignment so two robots sharing a site do
-        not both target the same dig position."""
-        return {r.work_cell for r in self.robots
+        not both target the same dig position.
+
+        `observer` restricts the answer to what that robot could actually
+        learn. A committed work cell is an INTENTION, not an object, so
+        it cannot be seen -- it has to be told. The filter is therefore
+        comm range, not sensor range: you see where a machine IS, you
+        hear where it is GOING. With comm_range=None this is unrestricted
+        and the old behaviour is reproduced exactly.
+
+        CALLED BY: robot.assign, to keep two robots sharing one task from
+        choosing the same dig cell p*.
+        """
+        others = (self.robots if observer is None
+                  else [r for r in self.robots if r is not observer]
+                  if self.comms.comm_range is None
+                  else self.comms.neighbors(observer))
+        return {r.work_cell for r in others
                 if r is not exclude and r.work_cell is not None}
 
     def _random_empty_coord(self) -> Coord:
+        """A random cell with no agent on it and traversable terrain.
+
+        Rejection sampling with no try limit -- safe here because setup
+        places only a handful of robots and tasks on a 32x32 grid, so
+        free cells are abundant.
+
+        CALLED BY: __init__ (initial robot placement) and
+        _random_diggable_coord.
+        """
         forbidden = (int(Terrain.DUMP_SITE), int(Terrain.BEDROCK))
         while True:
             c = (self.random.randrange(self.grid.width),
@@ -515,6 +736,14 @@ class ExcavationModel(Model):
                 return c
 
     def _random_diggable_coord(self) -> Coord:
+        """A random cell suitable for placing a task on: empty AND made
+        of terrain that can actually be excavated.
+
+        A task on bedrock or a dump site could never be completed, and
+        would stall the run forever since all_done would never be true.
+
+        CALLED BY: __init__, once per task created.
+        """
         while True:
             c = self._random_empty_coord()
             if self.grid.terrain.data[c] != int(Terrain.DUMP_SITE):
