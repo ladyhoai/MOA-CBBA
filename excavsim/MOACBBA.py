@@ -95,6 +95,46 @@ MAX_SHARERS = 3            # 1 reproduces single-robot-per-task
 MIN_SHARE = 1.2            # volume a seat must be worth having
 CAPACITY_AFFINITY = 0.25   # 0.0 removes mechanism 3
 SWITCH_MARGIN = 0.20       # en-route switch must be this much cheaper
+                           # (legacy "margin" criterion only -- see
+                           # SWITCH_CRITERION below)
+
+# Which test decides an en-route switch.
+#
+#   "rtlff"  -- Parker & Gini's Real-Time Latest Finishing First rule
+#               (AAMAS 2014, Sec. 6): move a robot from task i to task j
+#               only if task i STILL FINISHES BEFORE task j would, even
+#               after losing this robot:
+#
+#                   ct-_i  <  ct+_j
+#
+#               where ct-_i is i's completion time with one fewer digger
+#               and ct+_j is j's with one more, INCLUDING the transferring
+#               robot's travel time. See finishIfLeft / finishIfJoined.
+#
+#   "margin" -- the original rule: switch when the candidate is cheaper
+#               for ME by more than SWITCH_MARGIN. Kept for the ablation.
+#
+# Why the change. "margin" is a UNILATERAL test: it asks whether j is a
+# better deal for this robot and never asks what happens to i once the
+# robot walks away. That is a greed test, not an allocation test, and it
+# is why switching measured worse on both objectives -- a robot abandons
+# a half-approached pile because a nearer one looks cheap, and the pile
+# it left has to be re-approached from scratch by somebody further away.
+# The cost of the abandoned approach is real and nobody pays it in the
+# comparison.
+#
+# Parker & Gini hit this directly and say so. They considered the obvious
+# makespan-improving rule, max(ct_i, ct_j) >= max(ct-_i, ct+_j), and
+# rejected it because it "can cause assignment thrashing, especially when
+# there is noise or an error in the growth function" -- and our growth
+# function IS noisy, since bids are priced on each robot's own sensed map
+# under moving hazards and changing weather. Their greedy rule is
+# self-damping instead: after a transfer the two completion times are
+# approximately equal, so a further transfer between the same pair is
+# unlikely. That property is why "rtlff" needs no SWITCH_MARGIN and, in
+# principle, no SWITCH_LOCKOUT (the lockout is retained as a belt-and-
+# braces bound while the rule is unproven in this domain).
+SWITCH_CRITERION = "rtlff"
 
 # OFF BY DEFAULT ON MEASURED EVIDENCE. Paired 8-seed comparison, all
 # else identical: en-route switching was worse on 7 seeds, tied on 1 and
@@ -114,7 +154,7 @@ SWITCH_MARGIN = 0.20       # en-route switch must be this much cheaper
 # in a regime with more tasks per robot or heavier dynamics, where the
 # information a robot gains en route is worth more. Enable with
 # MOACBBAAllocator(enable_switching=True).
-ENABLE_SWITCHING = False
+ENABLE_SWITCHING = True
 # How many tasks a robot may add to its bundle in ONE auction round.
 #
 # The problem this fixes: createBundle used to fill the whole bundle
@@ -135,6 +175,53 @@ ENABLE_SWITCHING = False
 #
 # None = old behaviour (fill the bundle in one round).
 MAX_ADDS_PER_ROUND = 1
+
+# Re-price bundle entries the robot already holds, every round.
+#
+# The problem this fixes: createBundle skips any task already in the
+# bundle (`if j in self.bundle: continue`), so a bid was placed ONCE and
+# then never revisited. Its value stayed frozen at the world state and
+# robot position of whenever it was inserted -- while the terrain, the
+# weather, the robot's own known_blocked map and every peer's gossiped
+# completion time all moved on around it. A held claim was therefore the
+# one thing in the auction immune to new information, which is precisely
+# backwards: it is the claim the robot is most committed to.
+#
+# Two consequences were visible. First, reallocation could only ever be
+# failure-driven -- a task changed hands when it became IMPOSSIBLE (the
+# UNREACHABLE_PATIENCE release in robot.py), never when it merely became
+# a worse idea than someone else's. Second, myCompletion is built from
+# pathCost over the same held entries, so a robot broadcast a c_i
+# assembled from stale estimates, and every peer load-balanced its
+# makespan term against a schedule that had drifted.
+#
+# Re-pricing closes both through machinery that already exists: a robot
+# whose cost has risen simply loses the seat to one whose has not, via
+# the ordinary worst_seated / releaseOutbid path. Nothing new is
+# committed and no execution is interrupted -- the task under execution
+# is exempt (see repriceHeld).
+#
+# This is also the property Das et al. Sec. 3.7.1 argues is responsible
+# for CBPAE's advantage ("multi-round dynamic bidding with improved bids
+# in each round"): as residual_cost on the current task shrinks, a bid on
+# the NEXT task genuinely improves. Without re-pricing, MOA-CBBA had the
+# parallel auction-and-execution STRUCTURE but not that behaviour.
+#
+# Cost: one extra pathCost per held task per round, and more messages
+# (every re-place bumps the stamp). REPRICE_EPS is what keeps that
+# bounded -- see below. False = old behaviour, for the ablation.
+REPRICE_HELD = True
+
+# Relative change a re-priced bid must show before it is actually
+# re-placed. Every place() bumps the entry's stamp and so wins the next
+# merge and travels to every peer; re-placing on floating-point noise
+# would generate constant stamp churn and message traffic without moving
+# a single allocation. It also damps oscillation: MOA-CBBA has no
+# Lemma 4 clamp (its score is not monotone in t, so Choi et al.'s
+# condition (32) cannot hold anyway), and bids that may now move in BOTH
+# directions are exactly the case that clamp was guarding against, so the
+# hysteresis is doing real work rather than saving a few bytes.
+REPRICE_EPS = 0.02
 
 # Route around where a sensed obstacle is ABOUT to be, not just where it
 # was seen. Obstacles step with probability obstacle_move_probability
@@ -449,6 +536,168 @@ class MOACBBAAgent:
             self.place(j, me, cost)
             added += 1
 
+    def finishIfJoined(self, model, robot, task, seats) -> float:
+        """ct+_j -- when task j would finish if THIS robot joined it.
+
+        Parker & Gini's ct+ (AAMAS 2014, Sec. 6), the receiving side of
+        the RT-LFF transfer test. Priced through leg_cost from the
+        robot's CURRENT cell, so the approach leg it would have to drive
+        is inside the number: their rule requires the transferring
+        agent's travel delay to be charged to the receiving task, which
+        is exactly what makes the test refuse a distant "cheap" pile.
+
+        MATH:  ct+_j = now + tau_ij( V_j / k )  with k = expectedSharers
+        including this robot. The robot is the LAST to arrive, so its own
+        finish time is the task's finish time to a good approximation.
+
+        Returns INF when the task cannot be priced, which the caller must
+        treat as "not a candidate" rather than as a late finish -- see
+        the guard in _execute.
+        """
+        k = self.expectedSharers(task, robot.robot_id, seats)
+        tau, _e, q = leg_cost(model, robot, task,
+                              volume=task.remaining / k)
+        if q is None:
+            return INF
+        return model.tick + tau
+
+    def finishIfLeft(self, model, robot, task) -> float:
+        """ct-_i -- when this robot's CURRENT task would finish if it
+        walked away now.
+
+        The giving side of the RT-LFF test, and the term the old margin
+        criterion had no notion of at all.
+
+        TWO CASES.
+
+        Co-workers remain. The diggers left behind absorb this robot's
+        share, so the dig phase stretches by k/(k-1) for k current
+        sharers. Their finish times are taken from the GOSSIPED
+        completion times (self.completions) rather than recomputed --
+        pricing another robot's leg would need that robot's known_blocked
+        map, which this robot does not have and must not have. The
+        estimate is therefore a belief that lags by a round, in exactly
+        the same way marginalCost's others_c does.
+
+        Nobody remains. The pile goes back in the pool and waits for
+        somebody to be free, so it finishes no sooner than the fleet's
+        current bottleneck plus the whole job done solo:
+
+            ct-_i = othersCompletion + tau_ij( V_j )
+
+        That is deliberately pessimistic. Abandoning a task nobody else
+        is on is the move that produced the churn loop, and the RT-LFF
+        test should have to clear a high bar before making it.
+
+        Returns INF when nothing has been heard from the fleet yet, so a
+        robot with no gossip never switches -- the safe default, since
+        with no completion times the makespan term is uninformed.
+        """
+        me = robot.robot_id
+        others = [r for r in task.assignees if r != me]
+        if others:
+            k = max(1, len(task.assignees))
+            base = max((self.completions.get(r, 0.0) for r in others),
+                       default=0.0)
+            if base <= model.tick:
+                return INF          # no usable belief about them
+            return model.tick + (base - model.tick) * k / max(1, k - 1)
+
+        others_c = self.othersCompletion(me)
+        if others_c <= 0.0:
+            return INF              # nothing heard: refuse to switch
+        tau, _e, q = leg_cost(model, robot, task, volume=task.remaining)
+        if q is None:
+            return INF
+        return others_c + tau
+
+    def repriceHeld(self, model, robot, seats_fn, c_max, v_max,
+                    kappa) -> bool:
+        """Re-value every task already in the bundle against the CURRENT
+        world, and re-place the bid where it has materially moved.
+
+        The counterpart of createBundle: that method prices tasks the
+        robot does NOT hold, this one prices the tasks it does. Together
+        they mean no bid in the auction is older than one round. See the
+        REPRICE_HELD note at the top of this module for why holding a
+        frozen bid was the wrong default.
+
+        WHAT A HELD BID MEANS. createBundle sets a bid to the marginal
+        cost of INSERTING j into the path at its cheapest position, given
+        the bundle prefix at that moment (Choi et al. Eq. 3). That
+        definition is not re-computable later: the prefix has changed and
+        the path order it produced is not stored per-entry. What is
+        computable, and what this uses, is the LEAVE-ONE-OUT marginal --
+
+            base   = pathCost(path with j removed)
+            cost   = marginalCost(path as it stands, against base)
+
+        i.e. "what is j costing me, in this schedule, right now". For the
+        most recently added task the two coincide exactly; for earlier
+        entries they differ, because a later task may have absorbed some
+        of j's travel. Leave-one-out is the more honest of the two for
+        re-pricing anyway: it answers what the robot would actually save
+        by giving j up, which is the question a re-price exists to ask.
+
+        EXEMPTIONS, both deliberate:
+          - robot.task_id is skipped. The robot is physically in that
+            hole; releaseOutbid already refuses to release it, so
+            re-pricing could only ever move its bid without being able to
+            act on the result. Worse, a raised bid there could hand the
+            seat to a challenger in the bid table while the registry
+            check in _execute blocks the challenger from actually taking
+            it -- the phantom-seat case. Left alone on purpose.
+          - a task whose counterfactual path cannot be priced (base is
+            infinite) keeps its existing bid rather than being released:
+            an unpriceable COUNTERFACTUAL says nothing about whether j
+            itself is still feasible.
+
+        A task that has become genuinely infeasible (marginalCost returns
+        RELEASED) is released here. releaseOutbid then sees the robot is
+        no longer seated and cuts it along with its tail, which is the
+        correct Eq. (6) cascade -- every bid after it was priced as an
+        addition to a schedule that no longer exists.
+
+        RETURNS True if any bid moved, so the caller can keep the round
+        loop alive: a re-priced bid is new information that still has to
+        reach the fleet, and converging on the strength of "no merges
+        changed anything" would strand it.
+
+        CALLED BY: MOACBBAAllocator.allocate, once per robot per round,
+        immediately before createBundle.
+        """
+        me = robot.robot_id
+        others_c = self.othersCompletion(me)
+
+        def expected(task):
+            return self.expectedSharers(task, me, seats_fn(task))
+
+        moved = False
+        for j in list(self.bundle):
+            if j == robot.task_id or j not in self.path:
+                continue
+            task = model.tasks.get(j)
+            without = [t for t in self.path if t != j]
+            base_t, base_e = self.pathCost(model, robot, without, expected)
+            if base_t >= INF:
+                continue                 # counterfactual unpriceable: leave it
+            aff = self.capacityAffinity(robot, task, c_max, v_max, kappa)
+            cost = self.marginalCost(model, robot, self.path, base_t,
+                                     base_e, others_c, aff, expected)
+            old = self.bids.get((j, me), (RELEASED, -1))[0]
+            if cost >= RELEASED:
+                if old < RELEASED:
+                    self.release(j, me)
+                    moved = True
+                continue
+            # Hysteresis: only a material move is worth a fresh stamp and
+            # a broadcast to every peer.
+            if old >= RELEASED or \
+                    abs(cost - old) > REPRICE_EPS * max(1.0, abs(old)):
+                self.place(j, me, cost)
+                moved = True
+        return moved
+
     def releaseOutbid(self, robot, seats_fn, model) -> None:
         """Losing a seat invalidates every marginal cost after it, so the
         tail goes too (Choi et al. Eq. 6).
@@ -650,14 +899,22 @@ class MOACBBAAllocator:
                  min_share: float = MIN_SHARE,
                  capacity_affinity: float = CAPACITY_AFFINITY,
                  switch_margin: float = SWITCH_MARGIN,
+                 switch_criterion: str = SWITCH_CRITERION,
                  enable_switching: bool = ENABLE_SWITCHING,
-                 max_adds_per_round: int | None = MAX_ADDS_PER_ROUND) -> None:
+                 max_adds_per_round: int | None = MAX_ADDS_PER_ROUND,
+                 reprice_held: bool = REPRICE_HELD) -> None:
         self.max_adds_per_round = max_adds_per_round
+        self.reprice_held = bool(reprice_held)
+        self.n_repriced = 0        # rounds in which some bid moved
         self.obstacle_halo = bool(obstacle_halo)
         self.max_sharers = int(max_sharers)
         self.min_share = float(min_share)
         self.capacity_affinity = float(capacity_affinity)
         self.switch_margin = float(switch_margin)
+        if switch_criterion not in ("rtlff", "margin"):
+            raise ValueError("switch_criterion must be 'rtlff' or 'margin', "
+                             f"got {switch_criterion!r}")
+        self.switch_criterion = switch_criterion
         self.enable_switching = bool(enable_switching)
         self.last_round = 0
         self.converged = False
@@ -756,8 +1013,17 @@ class MOACBBAAllocator:
         self.converged = False
         for rnd in range(1, max_rounds + 1):
             self._clock += 1
+            repriced = []
             for robot in robots:
                 agent = self._agent(robot)
+                # Re-value what this robot already holds BEFORE deciding
+                # what to add: the marginal cost of a new task is
+                # measured against the existing path, so that path has to
+                # be priced against the current world first.
+                if self.reprice_held:
+                    repriced.append(
+                        agent.repriceHeld(model, robot, seats_fn, c_max,
+                                          v_max, self.capacity_affinity))
                 agent.createBundle(model, robot, seats_fn, c_max, v_max,
                                    self.capacity_affinity, robot.bundle_limit,
                                    self.max_adds_per_round)
@@ -777,7 +1043,12 @@ class MOACBBAAllocator:
             for r in robots:
                 self._agent(r).releaseOutbid(r, seats_fn, model)
             self.last_round = rnd
-            if not any(changed):
+            if any(repriced):
+                self.n_repriced += 1
+            # A re-priced bid is new information that has not reached the
+            # fleet yet, so it counts as a change: converging on "no
+            # merge altered anything" alone would strand it for a tick.
+            if not (any(changed) or any(repriced)):
                 self.converged = True
                 break
 
@@ -837,30 +1108,63 @@ class MOACBBAAllocator:
                     return agent.expectedSharers(task, me, seats_fn(task))
 
                 cur_task = model.tasks.get(robot.task_id)
-                cur_k = max(1, expected(cur_task))
-                cur_tau, cur_e, cur_q = leg_cost(
-                    model, robot, cur_task,
-                    volume=cur_task.remaining / cur_k)
-                current = (INF if cur_q is None
-                           else model.w1 * cur_tau + model.w2 * cur_e)
                 better = None
-                for j in agent.path:
-                    if j == robot.task_id:
-                        continue
-                    task = model.tasks.get(j)
-                    if not agent.seated(j, me, seats_fn(task)):
-                        continue
-                    if len(task.assignees) >= seats_fn(task):
-                        continue            # no seat actually free
-                    k = max(1, expected(task))
-                    tau, en, q = leg_cost(model, robot, task,
-                                          volume=task.remaining / k)
-                    if q is None:
-                        continue
-                    cost = model.w1 * tau + model.w2 * en
-                    if cost < current * (1.0 - self.switch_margin) \
-                            and (better is None or cost < better[0]):
-                        better = (cost, j)
+
+                if self.switch_criterion == "rtlff":
+                    # Parker & Gini RT-LFF: give up the current task only
+                    # if it still finishes FIRST without me. Among the
+                    # candidates that clear that bar, take the nearest --
+                    # their Algorithm RT-LFF picks argmin travel time, not
+                    # the latest-finishing target, so a switch never buys
+                    # balance with a long drive.
+                    ct_minus = agent.finishIfLeft(model, robot, cur_task)
+                    for j in agent.path:
+                        if j == robot.task_id:
+                            continue
+                        task = model.tasks.get(j)
+                        seats = seats_fn(task)
+                        if not agent.seated(j, me, seats):
+                            continue
+                        if len(task.assignees) >= seats:
+                            continue        # no seat actually free
+                        ct_plus = agent.finishIfJoined(model, robot, task,
+                                                       seats)
+                        if ct_plus >= INF:
+                            continue        # unpriceable, NOT "finishes late"
+                        if ct_minus < ct_plus \
+                                and (better is None or ct_plus < better[0]):
+                            better = (ct_plus, j)
+                else:
+                    # Legacy unilateral margin test, kept for the ablation.
+                    # Both sides priced HERE, from the same position, on
+                    # the same basis. Reading the stored bid for the
+                    # current task compared a value computed at assignment
+                    # time against rivals repriced this tick, so the
+                    # comparison drifted in favour of switching a little
+                    # more every tick.
+                    cur_k = max(1, expected(cur_task))
+                    cur_tau, cur_e, cur_q = leg_cost(
+                        model, robot, cur_task,
+                        volume=cur_task.remaining / cur_k)
+                    current = (INF if cur_q is None
+                               else model.w1 * cur_tau + model.w2 * cur_e)
+                    for j in agent.path:
+                        if j == robot.task_id:
+                            continue
+                        task = model.tasks.get(j)
+                        if not agent.seated(j, me, seats_fn(task)):
+                            continue
+                        if len(task.assignees) >= seats_fn(task):
+                            continue        # no seat actually free
+                        k = max(1, expected(task))
+                        tau, en, q = leg_cost(model, robot, task,
+                                              volume=task.remaining / k)
+                        if q is None:
+                            continue
+                        cost = model.w1 * tau + model.w2 * en
+                        if cost < current * (1.0 - self.switch_margin) \
+                                and (better is None or cost < better[0]):
+                            better = (cost, j)
                 if better is not None:
                     # Look before leaping: abandon_task() was previously
                     # called BEFORE the target was checked, so a switch

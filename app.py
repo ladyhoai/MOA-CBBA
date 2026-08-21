@@ -585,7 +585,7 @@ def DebugPanel(model):
 # between the widgets and the live model that the config panel exists to
 # expose.
 model_instance = ExcavationModel(
-    seed=23, allocator="moa-cbba",
+    seed=14, allocator="moa-cbba",
     weather_enabled=True, weather_change_rate=0.05,
     # Phase 4 is off in the model defaults; the dashboard turns it on so
     # there is something to look at.
