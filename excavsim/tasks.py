@@ -158,8 +158,13 @@ class TaskRegistry:
         express an en-route switch as an ordinary auction outcome rather
         than a special case.
 
-        CALLED BY: MOACBBAAllocator.allocate, to build each robot's
-        candidate task list each round."""
+        CALLED BY: nothing, currently. MOA-CBBA used to build its
+        candidate lists here and no longer does: this method answers from
+        the registry, i.e. from fleet-wide occupancy no robot could have
+        observed, so it has been replaced by belief.WorldBelief.candidates
+        which applies the SAME predicate to what one robot has sensed and
+        been told. Kept as the reference definition of the predicate, and
+        because a centralised allocator would legitimately want it."""
         return [t for t in self._tasks.values()
                 if not t.done and (robot_id in t.assignees
                                    or len(t.assignees) < max_sharers)]

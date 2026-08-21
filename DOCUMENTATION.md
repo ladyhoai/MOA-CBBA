@@ -413,6 +413,10 @@ excavsim/
   dynamics.py     Phase 4: hazards, wandering obstacles, weather.
   pathfinding.py  A* pathfinding + "nearest workable cell next to a target".
   comms.py        Inter-robot messaging: range, packet loss, latency, bandwidth.
+  belief.py       WorldBelief: one robot's private view of the world's changing
+                  state (pile volumes, who is digging what, peer capacities),
+                  built from its own sensors plus gossip. MOA-CBBA reads this
+                  instead of the shared TaskRegistry.
   bidding.py      leg_cost() and friends — turns (robot, task) into a priced bid.
   robot.py        ExcavatorRobot: the per-tick drive/dig/dump/unload execution loop.
   allocation.py   Allocator base class, GreedyAllocator, CBBA.
@@ -431,7 +435,8 @@ tests/            pytest validation suite (formulas vs. hand-computed values, et
 
 **Suggested reading order** if you're new to the code: `terrain.py` →
 `costs.py` → `tasks.py` → `fleet.py` → `bidding.py` → `robot.py` →
-`model.py` → `allocation.py` → `CBPAE.py` / `MOACBBA.py`. That roughly
+`model.py` → `allocation.py` → `belief.py` → `CBPAE.py` / `MOACBBA.py`.
+That roughly
 follows "what exists" → "what it costs to act" → "how one robot acts" →
 "how the world ticks" → "who decides what to do", which mirrors how the
 simulation actually executes.

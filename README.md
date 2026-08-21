@@ -10,6 +10,7 @@ Verified against **Mesa 3.5.1** (`pip install mesa pytest pandas`).
 | `excavsim/robot.py` | Robot `r_i` with `S_i` (immutable spec) and `M_i` (mutable state); travel→dig→dump→unload loop (Algorithm 1, line 8) |
 | `excavsim/costs.py` | Eqs. (1), (3), (4), (5) — closed-form `n_ij`, `τ_ij`, `E_ij`, `J(x)` used for bidding |
 | `excavsim/allocation.py` | Pluggable allocator interface; working greedy baseline; `CBBAAllocator` / `CBPAEAllocator` / `MOACBBAAllocator` scaffolds |
+| `excavsim/belief.py` | Per-robot beliefs about the world's *dynamic* state — pile volumes, who is digging what, peer capacities. Updated from own sensors + gossip only; MOA-CBBA reads this instead of the shared `TaskRegistry` |
 | `excavsim/pathfinding.py` | A* over the 8-connected grid (`d^{task/dump}_{ij}`) |
 | `excavsim/tasks.py` | Task registry — the source of truth behind the BAM `x_ij` |
 | `tests/test_costs.py` | Hand-computed checks of Eqs. (3)–(5) **and** proof that the tick-level simulation reproduces the closed forms exactly |

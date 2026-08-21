@@ -59,6 +59,30 @@ hit twice in this codebase (CBPAE.release, and the first draft of this
 file), so it is worth naming: min-cost consensus with no clock cannot
 distinguish new information from a stale echo.
 
+WHAT EACH ROBOT KNOWS. Nothing in this allocator reads fleet-wide
+ground truth to make a decision. A robot bids from two private stores:
+its bid table (above) and its WorldBelief (belief.py -- pile volumes,
+who is stationed where, peer hopper sizes), both filled only by its own
+sensors and by messages it personally received. Concretely, the things
+that used to be looked up in the shared TaskRegistry and are now
+believed: the candidate task list, remaining volume, whether a pile is
+finished, who is seated on it, how many seats it has, the fleet's
+largest hopper and largest open pile. Route costs were already local
+(bidding.leg_cost prices on robot.known_blocked). Even the auction's
+stopping rule is local -- each robot decides for itself whether it still
+has work to do this round (see MOACBBAAgent.beginRound).
+
+Three things remain central, none of which a robot acts on: the
+allocator schedules whose turn it is and moves the round clock;
+model.tasks.unfinished decides whether an auction runs at all and sizes
+the round budget (Choi et al. assume N and M known for exactly that
+bound); and robot.assign enforces physics, refusing a task with no free
+work cell. That last one is the world saying no, not shared bookkeeping.
+The visible cost of all this is that beliefs LAG: a robot can bid on a
+pile someone else has already emptied and drive there for nothing. That
+is the honest price of decentralisation and the thing a comm_range /
+packet_loss sweep exists to measure.
+
 New-reader primer: MOA-CBBA is this project's own extension of CBBA
 (allocation.py), built to fix two things a plain reward-maximising
 auction handles badly for this domain: it doesn't naturally balance
@@ -75,6 +99,7 @@ with a different price tag.
 
 from __future__ import annotations
 
+from .belief import WorldBelief
 from .comms import network_diameter
 from .bidding import EPS, INF, NOCOST, leg_cost, residual_cost
 from .pathfinding import work_candidates
@@ -154,7 +179,7 @@ SWITCH_CRITERION = "rtlff"
 # in a regime with more tasks per robot or heavier dynamics, where the
 # information a robot gains en route is worth more. Enable with
 # MOACBBAAllocator(enable_switching=True).
-ENABLE_SWITCHING = True
+ENABLE_SWITCHING = False
 # How many tasks a robot may add to its bundle in ONE auction round.
 #
 # The problem this fixes: createBundle used to fill the whole bundle
@@ -210,7 +235,33 @@ MAX_ADDS_PER_ROUND = 1
 # Cost: one extra pathCost per held task per round, and more messages
 # (every re-place bumps the stamp). REPRICE_EPS is what keeps that
 # bounded -- see below. False = old behaviour, for the ablation.
-REPRICE_HELD = True
+REPRICE_HELD = False
+
+# Does merging a peer's WORLD BELIEF (belief.py) keep the auction's round
+# loop alive, the way merging a peer's BID does?
+#
+# True  -- the round loop runs until bids AND notebooks have both
+#          settled. Information reaches the fleet a tick sooner, so
+#          allocations are made on fresher volumes and occupancy.
+# False -- the loop settles the auction only; beliefs propagate across
+#          ticks and are allowed to lag by a round.
+#
+# Nothing is stranded at False: a belief that MATTERS moves a price, and
+# repriceHeld re-places that bid and returns True, which does keep the
+# loop open. Only beliefs nobody bid on stop extending the auction.
+#
+# Measured on 12 seeds, 4 robots / 8 tasks, sensing on, default comms
+# (range 10, no loss): True is better on BOTH objectives -- 182.0 vs
+# 188.4 mean ticks and 71.99 vs 72.84 mean energy -- so it is the
+# default.
+#
+# The cost of True is extra auction rounds per tick, and it has NOT been
+# quantified here; it lands on the round budget, which is the term that
+# grows with fleet size and degrades with packet loss (lossy gossip
+# means some notebook differs almost every round). If a large-fleet or
+# high-loss sweep starts running long, this is the first switch to try,
+# and the rounds/tick figure is worth measuring before and after.
+BELIEF_BLOCKS_CONVERGENCE = True
 
 # Relative change a re-priced bid must show before it is actually
 # re-placed. Every place() bumps the entry's stamp and so wins the next
@@ -258,6 +309,48 @@ class MOACBBAAgent:
         self.task_list: list = []
         self._now = 0
         self.switched_tick = -10 ** 9      # last en-route switch
+        # This robot's private view of the world's DYNAMIC state -- how
+        # much soil is left in each pile, who is digging what, how big
+        # the other machines are. Updated from its own sensors and from
+        # gossip only; see belief.py. Every read that used to go to the
+        # shared TaskRegistry goes here instead.
+        self.belief = WorldBelief()
+        # "Do I still have something to do this round?" -- set by the
+        # four things that can change this robot's state (reprice, bundle
+        # growth, merge, release cascade) and read by the allocator to
+        # decide when to stop iterating. See beginRound.
+        self.active = True
+
+    # ---------------- round participation --------------------------- #
+    def beginRound(self) -> None:
+        """Declare myself idle for this round. Anything I actually DO
+        this round turns the flag back on.
+
+        THIS IS THE LOCAL TERMINATION SIGNAL. The allocator's round loop
+        used to stop on `any(changed) or any(repriced)` -- a fleet-wide
+        question ("did anything happen anywhere?") assembled by the
+        harness out of two of the four things that can change a robot's
+        state. Two consequences, both fixed by moving the decision in
+        here:
+
+          - BUNDLE GROWTH WAS INVISIBLE. createBundle reported nothing,
+            so a robot adding a task was only noticed indirectly, when a
+            peer merged the resulting bid. A robot alone in a comm
+            partition has no such peer, so the loop could declare the
+            auction settled while that robot still had bundle capacity
+            and MAX_ADDS_PER_ROUND = 1 left it adding one task per TICK
+            instead of one per round.
+          - PARTICIPATION WAS NOT A LOCAL DECISION. Whether robot A ran
+            another round depended on robot D still being busy, which A
+            had not been told. Now A answers only from what A did and
+            what A received; the allocator merely notices when every
+            robot has independently gone quiet, which is scheduling, not
+            knowledge.
+
+        CALLED BY: MOACBBAAllocator.allocate, at the top of each robot's
+        turn in each round.
+        """
+        self.active = False
 
     # ---------------- bid table ------------------------------------- #
     def _live(self, j) -> list[tuple[float, int]]:
@@ -367,8 +460,11 @@ class MOACBBAAgent:
                 continue
             task = model.tasks.get(task_id)
             k = 1 if sharers_fn is None else max(1, sharers_fn(task))
+            # BELIEVED volume, not the registry's: a bid must be priced
+            # on what this robot thinks is in the ground, or it is not a
+            # bid the robot could have arrived at on its own.
             tau, en, dump = leg_cost(model, robot, task, startPos,
-                                     volume=task.remaining / k)
+                                     volume=self.belief.remaining(model, task) / k)
             if dump is None:
                 return INF, INF
             e += en
@@ -425,7 +521,8 @@ class MOACBBAAgent:
         cost = model.w1 * (after - before) + model.w2 * (e - base_e)
         return cost * affinity
 
-    def capacityAffinity(self, robot, task, c_max, v_max, kappa) -> float:
+    def capacityAffinity(self, model, robot, task, c_max, v_max,
+                         kappa) -> float:
         """MECHANISM 3: make big machines prefer big piles.
 
         MATH -- a discount multiplier applied to the marginal cost:
@@ -452,12 +549,19 @@ class MOACBBAAgent:
         """
         if kappa <= 0.0 or c_max <= 0.0 or v_max <= 0.0:
             return 1.0
-        match = (robot.spec.capacity / c_max) * (task.remaining / v_max)
+        # Both normalisers are now BELIEFS: c_max is the largest hopper
+        # this robot has met (belief.fleet_capacity) and v_max the
+        # largest pile it knows of, so two robots can compute slightly
+        # different discounts for the same pair. That is correct -- the
+        # affinity is a private ranking preference, never a shared
+        # quantity, so a disagreement here costs nothing to consensus.
+        vol = self.belief.remaining(model, task)
+        match = (robot.spec.capacity / c_max) * (vol / v_max)
         return 1.0 - kappa * min(1.0, max(0.0, match))
 
     # ---------------- bundle ---------------------------------------- #
     def createBundle(self, model, robot, seats_fn, c_max, v_max,
-                     kappa, limit, max_adds=None) -> None:
+                     kappa, limit, max_adds=None) -> bool:
         """Grow this robot's bundle -- MOA-CBBA's phase 1.
 
         Structurally the same greedy insertion loop as CBBA's
@@ -483,6 +587,12 @@ class MOACBBAAgent:
         As in CBBA, every insertion POSITION is tried and the cheapest
         kept, so ordering is optimised rather than appended to.
 
+        RETURNS True if the bundle grew, which marks this robot as still
+        active for the round (see beginRound). Reporting this is what
+        stops a robot in a comm partition -- whose new bids nobody merges
+        -- from having its additions go unnoticed and the auction
+        declared settled underneath it.
+
         CALLED BY: MOACBBAAllocator.allocate, once per robot per round.
         """
         me = robot.robot_id
@@ -492,7 +602,7 @@ class MOACBBAAgent:
         # occupancy instead would price the first robot's bid as solo and
         # then never revise it.
         def expected(task):
-            return self.expectedSharers(task, me, seats_fn(task))
+            return self.expectedSharers(model, task, me, seats_fn(task))
         added = 0
         while len(self.bundle) < limit:
             if max_adds is not None and added >= max_adds:
@@ -508,7 +618,8 @@ class MOACBBAAgent:
                 seats = seats_fn(task)
                 if seats <= 0:
                     continue
-                aff = self.capacityAffinity(robot, task, c_max, v_max, kappa)
+                aff = self.capacityAffinity(model, robot, task, c_max,
+                                            v_max, kappa)
                 cheapest = None
                 for n in range(len(self.path) + 1):
                     trial = self.path[:n] + [j] + self.path[n:]
@@ -535,6 +646,8 @@ class MOACBBAAgent:
             self.path.insert(n, j)
             self.place(j, me, cost)
             added += 1
+            self.active = True
+        return added > 0
 
     def finishIfJoined(self, model, robot, task, seats) -> float:
         """ct+_j -- when task j would finish if THIS robot joined it.
@@ -554,9 +667,9 @@ class MOACBBAAgent:
         treat as "not a candidate" rather than as a late finish -- see
         the guard in _execute.
         """
-        k = self.expectedSharers(task, robot.robot_id, seats)
+        k = self.expectedSharers(model, task, robot.robot_id, seats)
         tau, _e, q = leg_cost(model, robot, task,
-                              volume=task.remaining / k)
+                              volume=self.belief.remaining(model, task) / k)
         if q is None:
             return INF
         return model.tick + tau
@@ -571,8 +684,10 @@ class MOACBBAAgent:
         TWO CASES.
 
         Co-workers remain. The diggers left behind absorb this robot's
-        share, so the dig phase stretches by k/(k-1) for k current
-        sharers. Their finish times are taken from the GOSSIPED
+        share, so the dig phase stretches by k/(k-1) for k BELIEVED
+        sharers (belief.seated_on, not the registry -- who else is in
+        this hole is something a robot sees or is told, never looks up).
+        Their finish times are taken from the GOSSIPED
         completion times (self.completions) rather than recomputed --
         pricing another robot's leg would need that robot's known_blocked
         map, which this robot does not have and must not have. The
@@ -594,9 +709,10 @@ class MOACBBAAgent:
         with no completion times the makespan term is uninformed.
         """
         me = robot.robot_id
-        others = [r for r in task.assignees if r != me]
+        seated = self.belief.seated_on(model, task)
+        others = [r for r in seated if r != me]
         if others:
-            k = max(1, len(task.assignees))
+            k = max(1, len(seated))
             base = max((self.completions.get(r, 0.0) for r in others),
                        default=0.0)
             if base <= model.tick:
@@ -606,7 +722,8 @@ class MOACBBAAgent:
         others_c = self.othersCompletion(me)
         if others_c <= 0.0:
             return INF              # nothing heard: refuse to switch
-        tau, _e, q = leg_cost(model, robot, task, volume=task.remaining)
+        tau, _e, q = leg_cost(model, robot, task,
+                              volume=self.belief.remaining(model, task))
         if q is None:
             return INF
         return others_c + tau
@@ -670,7 +787,7 @@ class MOACBBAAgent:
         others_c = self.othersCompletion(me)
 
         def expected(task):
-            return self.expectedSharers(task, me, seats_fn(task))
+            return self.expectedSharers(model, task, me, seats_fn(task))
 
         moved = False
         for j in list(self.bundle):
@@ -681,7 +798,8 @@ class MOACBBAAgent:
             base_t, base_e = self.pathCost(model, robot, without, expected)
             if base_t >= INF:
                 continue                 # counterfactual unpriceable: leave it
-            aff = self.capacityAffinity(robot, task, c_max, v_max, kappa)
+            aff = self.capacityAffinity(model, robot, task, c_max, v_max,
+                                        kappa)
             cost = self.marginalCost(model, robot, self.path, base_t,
                                      base_e, others_c, aff, expected)
             old = self.bids.get((j, me), (RELEASED, -1))[0]
@@ -696,6 +814,8 @@ class MOACBBAAgent:
                     abs(cost - old) > REPRICE_EPS * max(1.0, abs(old)):
                 self.place(j, me, cost)
                 moved = True
+        if moved:
+            self.active = True
         return moved
 
     def releaseOutbid(self, robot, seats_fn, model) -> None:
@@ -725,6 +845,13 @@ class MOACBBAAgent:
                 break
         if cut is None:
             return
+        # Cutting a tail is a real state change, so it keeps this robot
+        # active for the round. It is not always implied by a merge:
+        # seats_fn reads the WORLD BELIEF, and with
+        # BELIEF_BLOCKS_CONVERGENCE = False a belief update can shrink a
+        # seat count without any bid having moved -- which costs this
+        # robot a seat with nothing else flagging it.
+        self.active = True
         for j in self.bundle[cut:]:
             if j == robot.task_id:
                 continue
@@ -748,7 +875,11 @@ class MOACBBAAgent:
         keep = []
         for j in self.bundle:
             task = model.tasks.get(j)
-            if task.done:
+            # BELIEVED done. A robot that has not yet heard the pile was
+            # emptied keeps its bid and may still drive there -- the
+            # honest decentralised outcome, and the wasted trip is the
+            # measurable cost of a lossy or range-limited network.
+            if self.belief.is_done(model, task):
                 self.release(j, robot.robot_id)
                 continue
             keep.append(j)
@@ -758,7 +889,7 @@ class MOACBBAAgent:
         self.bundle = keep
 
     # ---------------- gossip ---------------------------------------- #
-    def expectedSharers(self, task, me, seats: int) -> int:
+    def expectedSharers(self, model, task, me, seats: int) -> int:
         """How many robots will be digging this task once the auction
         settles -- read off the BID TABLE, not off current occupancy.
 
@@ -789,12 +920,21 @@ class MOACBBAAgent:
         on the same volume, and that volume is what execution will
         actually see.
 
-        Union with assignees because a robot already digging holds its
-        seat through a LOCKED_COST entry, and with `me` because asking
-        "what would this task cost me" presumes joining it.
+        Union with the BELIEVED seat-holders because a robot already
+        digging holds its seat through a LOCKED_COST entry, and with `me`
+        because asking "what would this task cost me" presumes joining
+        it.
+
+        The occupancy half of that union used to be task.assignees, read
+        off the registry -- fleet-wide ground truth no robot could have
+        obtained by itself. It is now belief.seated_on, assembled from
+        this robot's own sightings and from gossip. Both halves of the
+        union are therefore local, and two robots may briefly disagree
+        about k; that disagreement decays as the station table
+        propagates, the same way a bid disagreement does.
         """
         j = task.task_id
-        who = set(self.winners(j, seats)) | set(task.assignees)
+        who = set(self.winners(j, seats)) | self.belief.seated_on(model, task)
         who.add(me)
         return max(1, min(len(who), seats))
 
@@ -817,14 +957,21 @@ class MOACBBAAgent:
         return max(vals) if vals else 0.0
 
     def broadcast(self, robot, now, sharers_fn=None) -> None:
-        """Send my whole bid table plus my projected completion time c_i.
+        """Send my whole bid table, my projected completion time c_i, and
+        my notebook about the world.
 
-        Two payload fields:
-          "bids" -- every (task, robot) -> (cost, stamp) entry I hold,
-                    keyed as "j:i" strings because the payload is a plain
-                    dict that gets deep-copied through the network.
-          "c"    -- my projected completion time, recomputed here so it
-                    reflects the bundle I just built.
+        Three payload fields:
+          "bids"   -- every (task, robot) -> (cost, stamp) entry I hold,
+                      keyed as "j:i" strings because the payload is a
+                      plain dict that gets deep-copied through the
+                      network.
+          "c"      -- my projected completion time, recomputed here so it
+                      reflects the bundle I just built.
+          "belief" -- WorldBelief.payload(): believed pile volumes, who
+                      is stationed where, and peer hopper sizes. This is
+                      the channel that replaces reading the TaskRegistry:
+                      without it a robot could not learn that a pile has
+                      shrunk or that someone has sat down on it.
 
         c_i MUST be computed on the same volume basis as the bids
         (hence sharers_fn), or peers load-balance against a schedule that
@@ -835,9 +982,16 @@ class MOACBBAAgent:
         self._now = now
         self.myCompletion, _e = self.pathCost(robot.model, robot, self.path,
                                               sharers_fn)
-        robot.send({"sender": robot.robot_id,
-                    "bids": {f"{j}:{i}": v for (j, i), v in self.bids.items()},
-                    "c": self.myCompletion})
+        payload = {"sender": robot.robot_id,
+                   "bids": {f"{j}:{i}": v for (j, i), v in self.bids.items()},
+                   "c": self.myCompletion}
+        # Omniscient runs (sensing_enabled=False) are the ablation
+        # baseline: every belief accessor reads ground truth, so shipping
+        # the tables would cost bandwidth and extra rounds to change
+        # nothing. Send them only when they are actually load-bearing.
+        if not self.belief.omniscient(robot.model):
+            payload["belief"] = self.belief.payload()
+        robot.send(payload)
 
     def resolveConflicts(self, robot, messages, now) -> bool:
         """Merge peers' bid tables into mine -- MOA-CBBA's phase 2.
@@ -875,6 +1029,16 @@ class MOACBBAAgent:
             c = msg.payload.get("c")
             if c is not None:
                 self.completions[k] = float(c)
+            # World beliefs merge on the same newer-stamp-wins rule as
+            # the bids. Whether that merge also keeps the round loop
+            # alive is an ablation axis -- see the
+            # BELIEF_BLOCKS_CONVERGENCE note at the top of this module
+            # for the trade (fresher information vs more rounds per tick)
+            # and the measurements behind the default.
+            belief = msg.payload.get("belief")
+            if belief and self.belief.merge(belief, now) \
+                    and BELIEF_BLOCKS_CONVERGENCE:
+                changed = True
             for key, (cost_k, stamp_k) in msg.payload.get("bids", {}).items():
                 j_s, i_s = key.split(":")
                 key2 = (int(j_s), int(i_s))
@@ -885,6 +1049,8 @@ class MOACBBAAgent:
                         (stamp_k == mine[1] and cost_k < mine[0] - EPS):
                     self.bids[key2] = (cost_k, stamp_k)
                     changed = True
+        if changed:
+            self.active = True
         return changed
 
 
@@ -921,13 +1087,30 @@ class MOACBBAAllocator:
         self._clock = 0
         self.n_switches = 0
         self.max_sharers_seen = 0
+        # (robot_id, task_id) -> free work cells, cleared every tick.
+        # See _free_cells for why a per-tick memo is safe.
+        self._seat_cache: dict[tuple[int, int], int] = {}
 
     def _agent(self, robot):
         return getattr(robot, self.AGENT_ATTR)
 
+    def _seats_fn(self, model, robot):
+        """`seats_for` bound to one robot, for the call sites that take a
+        one-argument seat function.
+
+        Exists because seats_for stopped being a fleet-wide quantity: it
+        is computed from this robot's hazard map and volume beliefs, so
+        every caller has to say WHOSE seat count it wants. Sharing one
+        closure across the fleet -- which the old code could safely do --
+        would now silently price every robot's seats against whichever
+        robot happened to bind it last.
+        """
+        return lambda task: self.seats_for(model, robot, task)
+
     # ---------------------------------------------------------------- #
-    def seats_for(self, model, task) -> int:
-        """How many robots this task is worth, and can physically hold.
+    def seats_for(self, model, robot, task) -> int:
+        """How many robots this task is worth, and can physically hold --
+        AS THIS ROBOT SEES IT.
 
         MECHANISM 4's seat budget. MATH -- the minimum of three caps:
 
@@ -945,15 +1128,53 @@ class MOACBBAAllocator:
         are places to stand just produces collisions and STUCK_LIMIT
         waits.
 
-        CALLED BY: MOACBBAAllocator.allocate, wrapped as `seats_fn` and
-        passed down into createBundle, releaseOutbid and _execute.
+        NOW PER ROBOT, and that is the point. Both the volume cap and
+        the work-cell cap used to be computed from ground truth --
+        task.remaining and model.blocked_cells() -- which made the seat
+        count a single fleet-wide number no robot could actually have
+        derived. model.blocked_cells is omniscient by construction (see
+        its docstring), so a robot was sizing seats against hazards it
+        had never sensed. Both now come from this robot's own view:
+        belief.remaining for the economics, robot.known_blocked for the
+        physics, exactly as bidding.leg_cost already did for routes.
+
+        The consequence is that seats_fn is robot-dependent, so `winners`
+        and `worst_seated` can disagree across the fleet about who holds
+        the marginal seat. That is a normal decentralised transient: the
+        bid table itself is consensual, only its interpretation is local,
+        and the interpretation converges as hazard maps and volume
+        beliefs propagate.
+
+        CALLED BY: MOACBBAAllocator.allocate, bound per robot as
+        `seats_fn` and passed down into createBundle, repriceHeld,
+        releaseOutbid and _execute.
         """
         if self.max_sharers <= 1:
             return 1
-        by_volume = int(task.remaining // self.min_share)
-        free = len(work_candidates([task.cell], model.grid.width,
-                                   model.grid.height, model.blocked_cells()))
-        return max(1, min(self.max_sharers, by_volume, free))
+        belief = self._agent(robot).belief
+        by_volume = int(belief.remaining(model, task) // self.min_share)
+        return max(1, min(self.max_sharers, by_volume,
+                          self._free_cells(model, robot, task)))
+
+    def _free_cells(self, model, robot, task) -> int:
+        """|work_candidates(l_j)| against THIS robot's hazard map,
+        memoised for the tick.
+
+        The memo matters: seats_fn is called once per candidate task per
+        insertion position per round, and known_blocked() rebuilds a set
+        on every call. Robots do not move during an auction (the same
+        invariant bidding.leg_cache relies on) and known_blocked only
+        changes when sense() runs, so a per-tick entry cannot go stale
+        inside a round. Cleared at the top of allocate.
+        """
+        key = (robot.robot_id, task.task_id)
+        hit = self._seat_cache.get(key)
+        if hit is None:
+            hit = len(work_candidates([task.cell], model.grid.width,
+                                      model.grid.height,
+                                      robot.known_blocked()))
+            self._seat_cache[key] = hit
+        return hit
 
     # ---------------------------------------------------------------- #
     def allocate(self, model) -> None:
@@ -963,10 +1184,12 @@ class MOACBBAAllocator:
         of (bid, broadcast, deliver, resolve), then execute -- with these
         differences:
 
-          - Candidate lists come from tasks.seats_open, so they include
-            tasks the robot is already travelling to (which is what makes
-            an en-route switch expressible as an ordinary auction result)
-            and tasks that already have other robots on them.
+          - Candidate lists come from each robot's own WorldBelief, so
+            they include tasks the robot is already travelling to (which
+            is what makes an en-route switch expressible as an ordinary
+            auction result) and tasks it believes have room for another
+            machine. Two robots can hold different candidate lists at the
+            same instant; that is the point.
           - releaseOutbid runs after every round's merge.
           - The round budget uses N_min = min(|tasks| * max_sharers,
             |robots| * L_t), scaled by max_sharers because there are that
@@ -976,6 +1199,21 @@ class MOACBBAAllocator:
             continuously as robots work.
           - Execution is delegated to _execute, which handles seat caps
             and optional en-route switching.
+          - The rounds stop when every robot has INDEPENDENTLY reported
+            itself idle (MOACBBAAgent.active), rather than on a
+            fleet-wide "did anything change anywhere" test. See
+            beginRound.
+
+        WHAT IS AND IS NOT CENTRAL HERE. This method is a scheduler: it
+        decides whose turn it is, moves the clock, and calls the network.
+        None of that is knowledge a robot acts on. Everything a robot
+        DECIDES with -- candidate tasks, pile volumes, who is seated,
+        seat counts, peer capacities, completion times -- comes from its
+        own WorldBelief and bid table, filled only by its own sensors and
+        by messages it personally received. The single ground-truth read
+        left is `model.tasks.unfinished`, used to decide whether to run
+        an auction at all and to size the round budget; no bid depends on
+        it. Physical limits are enforced by the world, in robot.assign.
 
         CALLED BY: model.step, once per tick, via model.allocator.
         """
@@ -985,24 +1223,39 @@ class MOACBBAAllocator:
         model.obstacle_halo_enabled = self.obstacle_halo
 
         robots = list(model.robots)
+        # The ONE deliberate ground-truth read left in this method, and
+        # it is scheduling rather than decision-making: "is there any
+        # work left at all" decides whether the harness bothers running
+        # an auction, and |tasks| sizes the round budget below. Choi et
+        # al. assume N and M are known constants for exactly that bound,
+        # and no robot's bid depends on this value. Everything a robot
+        # actually decides with comes from its WorldBelief.
         open_tasks = model.tasks.unfinished
         if not robots or not open_tasks:
             return
 
-        c_max = max(r.spec.capacity for r in robots)
-        v_max = max(t.remaining for t in open_tasks)
-        seats_fn = lambda t: self.seats_for(model, t)   # noqa: E731
+        self._seat_cache = {}          # robots do not move within a tick
 
+        # One clock step for the tick itself, so first-hand observations
+        # are stamped before any of this tick's rounds and a robot's own
+        # reading about itself always outranks a peer's relayed copy.
+        self._clock += 1
         for r in robots:
             agent = self._agent(r)
+            agent.belief.observe(model, r, self._clock)
             agent.prune(model, r)
-            # A robot may bid on any unfinished task with a free seat,
-            # plus the one it is already working. Crucially this includes
-            # tasks it is merely TRAVELLING to -- that is what makes an
-            # en-route switch expressible as an ordinary auction result
-            # rather than a special case.
-            agent.task_list = model.tasks.seats_open(r.robot_id,
-                                                     self.max_sharers)
+            # A robot may bid on any task it BELIEVES is unfinished with
+            # a free seat, plus the one it is already working. Crucially
+            # this includes tasks it is merely TRAVELLING to -- that is
+            # what makes an en-route switch expressible as an ordinary
+            # auction result rather than a special case.
+            #
+            # This used to be model.tasks.seats_open(...), which filtered
+            # on the registry's assignee sets: fleet-wide occupancy that
+            # no robot could have known. belief.candidates applies the
+            # same predicate to what this robot has seen and been told.
+            agent.task_list = agent.belief.candidates(model, r,
+                                                      self.max_sharers)
             r.receive_all()
 
         L_t = max(r.bundle_limit for r in robots)
@@ -1016,6 +1269,18 @@ class MOACBBAAllocator:
             repriced = []
             for robot in robots:
                 agent = self._agent(robot)
+                # Idle until proven otherwise: repriceHeld, createBundle,
+                # resolveConflicts and releaseOutbid each switch this
+                # robot back on if they actually change something of its.
+                agent.beginRound()
+                # Everything this robot bids with is now bound to THIS
+                # robot: its own seat counts, its own view of the fleet's
+                # biggest hopper, its own view of the biggest open pile.
+                # Peers will compute slightly different numbers, which is
+                # what a decentralised auction looks like.
+                seats_fn = self._seats_fn(model, robot)
+                c_max = agent.belief.fleet_capacity(model, robot)
+                v_max = agent.belief.largest_open(model, agent.task_list)
                 # Re-value what this robot already holds BEFORE deciding
                 # what to add: the marginal cost of a new task is
                 # measured against the existing path, so that path has to
@@ -1034,28 +1299,45 @@ class MOACBBAAllocator:
                 # does not exist.
                 agent.broadcast(
                     robot, self._clock,
-                    lambda t: agent.expectedSharers(t, robot.robot_id,
+                    lambda t: agent.expectedSharers(model, t, robot.robot_id,
                                                     seats_fn(t)))
             model.comms.flush_and_deliver(model.tick)
-            changed = [self._agent(r).resolveConflicts(r, r.receive_all(),
-                                                       self._clock)
-                       for r in robots]
             for r in robots:
-                self._agent(r).releaseOutbid(r, seats_fn, model)
+                self._agent(r).resolveConflicts(r, r.receive_all(),
+                                                self._clock)
+            for r in robots:
+                # Bound per robot: since seats_for became robot-relative,
+                # reusing one robot's seat function for the whole fleet
+                # would have every machine testing its seat against
+                # somebody else's hazard map.
+                self._agent(r).releaseOutbid(r, self._seats_fn(model, r),
+                                             model)
             self.last_round = rnd
             if any(repriced):
                 self.n_repriced += 1
-            # A re-priced bid is new information that has not reached the
-            # fleet yet, so it counts as a change: converging on "no
-            # merge altered anything" alone would strand it for a tick.
-            if not (any(changed) or any(repriced)):
+            # EVERY ROBOT HAS INDEPENDENTLY GONE QUIET.
+            #
+            # Each `active` flag is decided by its own robot, from its
+            # own actions and the messages it personally received --
+            # never from anything a peer did not send it. The allocator
+            # only counts the votes, which is scheduling, not knowledge:
+            # a robot that reports idle would spend a further round doing
+            # nothing, so stopping here reaches the same allocation as
+            # running out the N_min * D budget, for a fraction of the
+            # work.
+            #
+            # This replaces `any(changed) or any(repriced)`, which asked
+            # a fleet-wide question and missed two of the four ways a
+            # robot's state can move -- see beginRound for what that cost
+            # a robot sitting alone in a comm partition.
+            if not any(self._agent(r).active for r in robots):
                 self.converged = True
                 break
 
-        self._execute(model, robots, seats_fn)
+        self._execute(model, robots)
 
     # ---------------------------------------------------------------- #
-    def _execute(self, model, robots, seats_fn) -> None:
+    def _execute(self, model, robots) -> None:
         """Turn the settled auction into actual assignments.
 
         TWO PHASES per robot:
@@ -1076,11 +1358,11 @@ class MOACBBAAllocator:
            default (measured worse on both objectives).
 
         2. SEATING. An idle robot walks its path and takes the first task
-           where it holds a seat AND the task has room. The seat cap is
-           enforced against the REGISTRY (task.assignees), not the local
-           bid table: mid-auction robots' views differ, so k robots can
-           each believe they hold one of the k cheapest seats, and only
-           the task itself knows how many have actually sat down.
+           where it holds a seat AND it believes the task has room. The
+           cap is tested against belief.sharers -- this robot's own view
+           of who is digging what -- not against the registry, which no
+           robot can read. Physical over-subscription is caught by
+           robot.assign, which refuses when there is no free work cell.
 
         If assign() refuses (no free work cell, no reachable dump), the
         task is dropped from the bundle AND the seat released -- keeping
@@ -1091,6 +1373,7 @@ class MOACBBAAllocator:
         for robot in robots:
             agent = self._agent(robot)
             me = robot.robot_id
+            seats_fn = self._seats_fn(model, robot)
 
             # --- en-route switching --------------------------------- #
             # Only in execution phase 1 with an empty hopper (Das et al.
@@ -1105,7 +1388,8 @@ class MOACBBAAllocator:
                 # rivals repriced this tick, so the comparison drifted in
                 # favour of switching a little more every tick.
                 def expected(task):
-                    return agent.expectedSharers(task, me, seats_fn(task))
+                    return agent.expectedSharers(model, task, me,
+                                                 seats_fn(task))
 
                 cur_task = model.tasks.get(robot.task_id)
                 better = None
@@ -1125,8 +1409,8 @@ class MOACBBAAllocator:
                         seats = seats_fn(task)
                         if not agent.seated(j, me, seats):
                             continue
-                        if len(task.assignees) >= seats:
-                            continue        # no seat actually free
+                        if agent.belief.sharers(model, task) >= seats:
+                            continue        # no seat I believe is free
                         ct_plus = agent.finishIfJoined(model, robot, task,
                                                        seats)
                         if ct_plus >= INF:
@@ -1145,7 +1429,7 @@ class MOACBBAAllocator:
                     cur_k = max(1, expected(cur_task))
                     cur_tau, cur_e, cur_q = leg_cost(
                         model, robot, cur_task,
-                        volume=cur_task.remaining / cur_k)
+                        volume=agent.belief.remaining(model, cur_task) / cur_k)
                     current = (INF if cur_q is None
                                else model.w1 * cur_tau + model.w2 * cur_e)
                     for j in agent.path:
@@ -1154,11 +1438,12 @@ class MOACBBAAllocator:
                         task = model.tasks.get(j)
                         if not agent.seated(j, me, seats_fn(task)):
                             continue
-                        if len(task.assignees) >= seats_fn(task):
-                            continue        # no seat actually free
+                        if agent.belief.sharers(model, task) >= seats_fn(task):
+                            continue        # no seat I believe is free
                         k = max(1, expected(task))
-                        tau, en, q = leg_cost(model, robot, task,
-                                              volume=task.remaining / k)
+                        tau, en, q = leg_cost(
+                            model, robot, task,
+                            volume=agent.belief.remaining(model, task) / k)
                         if q is None:
                             continue
                         cost = model.w1 * tau + model.w2 * en
@@ -1186,12 +1471,23 @@ class MOACBBAAllocator:
                 task = model.tasks.get(task_id)
                 if not agent.seated(task_id, me, seats_fn(task)):
                     continue
-                # Seat cap is enforced HERE, against the registry, not
-                # against the local bid table. Mid-auction the robots'
-                # views differ, so k robots can each believe they hold
-                # one of the k cheapest seats; only the task itself knows
-                # how many are actually sitting down.
-                if len(task.assignees) >= seats_fn(task):
+                # Seat cap tested against what this robot BELIEVES the
+                # occupancy to be. It used to read task.assignees, i.e.
+                # the registry -- a central referee that knew exactly how
+                # many machines had sat down. A robot has no such oracle;
+                # it has its own sightings and whatever the fleet has
+                # told it, so that is what it decides on.
+                #
+                # The referee is not gone, it has moved to where it
+                # physically belongs: robot.assign refuses a task with no
+                # free work cell, which is the real constraint (you
+                # cannot stand where a co-worker is standing) and is
+                # enforced by the world rather than by shared bookkeeping.
+                # A stale belief can therefore briefly overshoot the
+                # policy cap when the site has room for the extra machine;
+                # the next round's gossip corrects it, and the overshoot
+                # is itself a decentralisation cost worth measuring.
+                if agent.belief.sharers(model, task) >= seats_fn(task):
                     continue
                 if robot.assign(task_id):
                     break
